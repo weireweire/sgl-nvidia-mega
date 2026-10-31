@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 from functools import cache
 from pathlib import Path
 from typing import Optional
@@ -51,6 +52,20 @@ HEADERS = ("route.cuh",)
 GEMM1_PARAMETERS = ("A", "SFA", "X", "XS", "route", "clamp", "H", "HS", "cta_words")
 GEMM2_PARAMETERS = ("A", "SFA", "H", "HS", "route", "Y", "cta_words")
 PARAMETERS = {"gemm1": GEMM1_PARAMETERS, "gemm2": GEMM2_PARAMETERS}
+# SGL_NVIDIA_MEGA_MOE_STRIDED_GEMM=1: the GEMM pair on a strided 1-D grid of
+# min(SMs - STRIDED_SIDE_SMS, tiles) CTAs instead of cluster launch control over every
+# SM, so the shared expert and hC kernels on the side streams keep SMs (the reference
+# tools/routed_expert_gemm_strided.py builds of these same kernels). The 384-expert
+# top-6 GEMM1 whose largest routing can need a partial second round strides over a
+# balanced CTA count instead. Every tile stays whole on one CTA: bitwise either way.
+STRIDED_GEMM = os.environ.get("SGL_NVIDIA_MEGA_MOE_STRIDED_GEMM", "0") == "1"
+STRIDED_SIDE_SMS = 8
+# (kernel name, launch.json entry, source)
+STRIDED_KERNELS = (
+    ("gemm1_strided", "gemm1", "gemm1_strided.cu"),
+    ("gemm1_balanced", "gemm1", "gemm1_strided_balanced.cu"),
+    ("gemm2_strided", "gemm2", "gemm2_strided.cu"),
+)
 
 
 def compile_source(source, name, arch, options=NVRTC_OPTIONS, headers=None) -> bytes:
@@ -125,6 +140,15 @@ def load_kernels(device_index: int) -> dict[str, _Kernel]:
                 fact["block"],
                 int(fact["shared_memory_bytes"]),
             )
+        if STRIDED_GEMM:
+            for name, entry, file in STRIDED_KERNELS:
+                fact = facts[entry]
+                kernels[name] = _load(
+                    compile_source((SOURCE_DIR / file).read_text(), name, arch),
+                    fact["symbol"],
+                    fact["block"],
+                    int(fact["shared_memory_bytes"]),
+                )
         return kernels
 
 
@@ -332,6 +356,34 @@ class RoutedExpertGemm:
             _scale_map(w13_scale, 4),
         )
         self.gemm2_maps = (_weight_map(w2, HIDDEN, PADDED, 2), _scale_map(w2_scale, 1))
+        self._strided_sms = (
+            torch.cuda.get_device_properties(w13.device).multi_processor_count
+            - STRIDED_SIDE_SMS
+            if STRIDED_GEMM
+            else 0
+        )
+
+    def _gemm_launches(self, ctas: int, top_k: int):
+        """(GEMM1 kernel, grid), (GEMM2 kernel, grid) for ``ctas`` token tiles; fixed
+        by the call's shape, never by its routes, so one graph keeps one kernel."""
+        if not self._strided_sms:
+            return (
+                (self.kernels["gemm1"], (GEMM1_UNITS, ctas, 1)),
+                (self.kernels["gemm2"], (GEMM2_UNITS, ctas, 1)),
+            )
+        tiles1 = GEMM1_UNITS * ctas
+        grid1 = min(self._strided_sms, tiles1)
+        balanced = self.experts == 384 and top_k == 6 and tiles1 > grid1
+        return (
+            (
+                self.kernels["gemm1_balanced" if balanced else "gemm1_strided"],
+                (grid1, 1, 1),
+            ),
+            (
+                self.kernels["gemm2_strided"],
+                (min(self._strided_sms, GEMM2_UNITS * ctas), 1, 1),
+            ),
+        )
 
     def supports(self, x_quant, x_scale, topk_ids, topk_weights) -> bool:
         rows = x_quant.size(0)
@@ -401,9 +453,10 @@ class RoutedExpertGemm:
             (rows * top_k * TILE, HIDDEN), dtype=torch.bfloat16, device=device
         )
         words = ctypes.c_int32(cta_words(ctas))
+        (gemm1, grid1), (gemm2, grid2) = self._gemm_launches(ctas, top_k)
         _launch(
-            self.kernels["gemm1"],
-            (GEMM1_UNITS, ctas, 1),
+            gemm1,
+            grid1,
             [
                 *self.gemm1_maps,
                 _pointer(x_quant),
@@ -417,8 +470,8 @@ class RoutedExpertGemm:
             stream,
         )
         _launch(
-            self.kernels["gemm2"],
-            (GEMM2_UNITS, ctas, 1),
+            gemm2,
+            grid2,
             [
                 *self.gemm2_maps,
                 _pointer(h_values),
@@ -544,9 +597,10 @@ class RoutedExpertGemm:
             (rows * self.top_k * TILE, HIDDEN), dtype=torch.bfloat16, device=device
         )
         words = ctypes.c_int32(cta_words(ctas))
+        (gemm1, grid1), (gemm2, grid2) = self._gemm_launches(ctas, self.top_k)
         _launch(
-            self.kernels["gemm1"],
-            (GEMM1_UNITS, ctas, 1),
+            gemm1,
+            grid1,
             [
                 *self.gemm1_maps,
                 _pointer(x_quant),
@@ -560,8 +614,8 @@ class RoutedExpertGemm:
             stream,
         )
         _launch(
-            self.kernels["gemm2"],
-            (GEMM2_UNITS, ctas, 1),
+            gemm2,
+            grid2,
             [
                 *self.gemm2_maps,
                 _pointer(h_values),

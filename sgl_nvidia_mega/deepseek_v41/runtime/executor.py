@@ -37,9 +37,16 @@ try:
 except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
     from sglang.srt.megakernels.spec import Step
 
-from sgl_nvidia_mega.deepseek_v41 import attention, boundary, engram, logits, moe
+from sgl_nvidia_mega.deepseek_v41 import (
+    attention,
+    boundary,
+    engram,
+    logits,
+    moe,
+    sglang_ops,
+)
 from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS, embedding
-from sgl_nvidia_mega.deepseek_v41.runtime.state import StepState
+from sgl_nvidia_mega.deepseek_v41.runtime.state import AuxPack, StepState
 
 logger = logging.getLogger(__name__)
 
@@ -187,7 +194,8 @@ class MegakernelDecode:
         )
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden, pre_hc_head = self._model_forward(st, input_embeds)
-        aux = st.aux if lm.capture_aux_hidden_states else None
+        packed = lm.capture_aux_hidden_states and st.aux is not None
+        aux = st.aux.packed() if packed else None
         return logits.logits(st, hidden, pre_hc_head, aux)
 
     def _model_forward(self, st, input_embeds):
@@ -199,7 +207,8 @@ class MegakernelDecode:
             attention.head(st)
             x = embedding.embed(st) if input_embeds is None else input_embeds
             x = hc_broadcast(x, m.hc_mult)
-            st.aux = [] if m.dspark_layers_to_capture is not None else None
+            capture = m.dspark_layers_to_capture
+            st.aux = AuxPack(x, len(capture)) if capture is not None else None
             # the compressor caches each step's rotary tables on the batch
             for attr in ("freqs_cis_c4", "freqs_cis_c128"):
                 if hasattr(st.fb, attr):
@@ -232,7 +241,7 @@ class MegakernelDecode:
             # aux_mean_stats its mean runs on the mHC stats stream (joined in final)
             aux = st.aux if i in capture and AUX_MEAN_STATS else None
             if i in capture and aux is None:
-                st.aux.append(st.state.residual.mean(dim=1))
+                sglang_ops.stream_mean(st.state.residual, out=st.aux.take())
             with recorder.with_current_layer(i), st.exit:
                 a_in = boundary.pre(layer, "attn", st, aux)
                 part = attention.step(layer, a_in, st)

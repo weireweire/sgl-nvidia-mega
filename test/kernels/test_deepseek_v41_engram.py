@@ -194,7 +194,7 @@ def _run(b, streams, side, *, late_ns=0):
     if late_ns:
         with torch.cuda.stream(side):
             torch.cuda._sleep(late_ns)
-    mean = b._aux_mean(streams, side, st)
+    mean = b._aux_mean(streams, side, st, streams.new_empty(streams[:, 0].shape))
     b.join_aux(st)
     # a main-stream reader of the mean (the draft head's input)
     return mean * 1.0

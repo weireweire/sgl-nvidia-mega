@@ -11,6 +11,8 @@ from __future__ import annotations
 import functools
 import importlib
 
+import torch
+
 # (module, attribute) candidates per operator, newest SGLang first
 CANDIDATES = {
     "rmsnorm_mxfp8": (
@@ -31,6 +33,7 @@ CANDIDATES = {
         ("sglang.kernels.ops.layernorm.mhc", "mhc_combine"),
         ("sglang.kernels.ops.layernorm.mhc", "hc_combine"),
     ),
+    "stream_mean": (("sglang.kernels.ops.layernorm.mhc", "mhc_stream_mean"),),
     "silu_and_mul_clamp": (
         ("sglang.kernels.ops.activation.silu_and_mul_clamp", "silu_and_mul_clamp"),
         ("sglang.kernels.ops.moe.dsv4", "silu_and_mul_clamp"),
@@ -73,6 +76,19 @@ def per_token_group_quant_fp8_wo_a(*args, **kwargs):
 
 def hc_combine(*args, **kwargs):
     return resolve("hc_combine")(*args, **kwargs)
+
+
+def hc_combine_widens() -> bool:
+    """SGLang's newer combine widens BF16 streams to FP32 as it loads them."""
+    return resolve("hc_combine").__name__ == "mhc_combine"
+
+
+def stream_mean(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """``x.mean(dim=1)`` written into ``out`` (bitwise either way)."""
+    try:
+        return resolve("stream_mean")(x, out=out)
+    except ImportError:
+        return out.copy_(x.mean(dim=1))
 
 
 def silu_and_mul_clamp(*args, **kwargs):

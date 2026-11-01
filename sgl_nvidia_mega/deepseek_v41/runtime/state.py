@@ -55,7 +55,7 @@ class StepState:
         self.exit: contextlib.ExitStack = contextlib.ExitStack()
         # step outputs and per-step inputs
         self.hash_ids: Optional[torch.Tensor] = None  # Engram token hashes
-        self.aux: Optional[list] = None  # the draft's captured hidden states
+        self.aux: Optional[AuxPack] = None  # the draft's captured hidden states
         self.scratch: dict[str, Any] = {}
         # FlashMLA schedules forked at the step head, joined by the first attention
         self.flashmla_sched: list = []
@@ -64,3 +64,23 @@ class StepState:
         """SGLang's ForwardView of this forward: the step's own, else the one the
         binding builds from the forward context running now."""
         return self.view if self.view is not None else self.binding.forward_view()
+
+
+class AuxPack:
+    """The draft's captured hidden states in one [rows, count * dim] buffer: SGLang's
+    packed form, which the logits processor and the commit projection read as is."""
+
+    def __init__(self, streams: torch.Tensor, count: int):
+        rows, _, dim = streams.shape
+        self.buffer = streams.new_empty((rows, count * dim))
+        self._dim, self._count, self._taken = dim, count, 0
+
+    def take(self) -> torch.Tensor:
+        """The next capture's [rows, dim] slot."""
+        start = self._taken * self._dim
+        self._taken += 1
+        return self.buffer[:, start : start + self._dim]
+
+    def packed(self) -> torch.Tensor:
+        assert self._taken == self._count, (self._taken, self._count)
+        return self.buffer

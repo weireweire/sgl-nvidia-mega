@@ -217,7 +217,7 @@ class Boundaries:
         )
         mhc.fork_stats_stream(stream)
         if aux is not None:
-            aux.append(self._aux_mean(streams, stream, st))
+            self._aux_mean(streams, stream, st, aux.take())
         quantized = [] if attention and self._attn_mxfp8[layer.layer_id] else None
         hc = layer.attn_hc if attention else layer.ffn_hc
         x = mhc.combine(hc, state, quantized)
@@ -373,22 +373,23 @@ class Boundaries:
             return "SGLang's"
         return f"DeepGEMM TF32 at 1-{prenorm.MAX_ROWS} rows ({prenorm.SLICES} slices)"
 
-    def _aux_mean(self, streams, stream, st: BoundaryState) -> torch.Tensor:
+    def _aux_mean(self, streams, stream, st: BoundaryState, out) -> torch.Tensor:
         """The draft head's capture of a layer's attention input: on the stats stream
         beside the attention when the layer has one and the step is narrow (the main
         stream otherwise: at wide steps the side stream competes with the attention)."""
+        from sgl_nvidia_mega.deepseek_v41 import sglang_ops
+
         if stream is None or streams.shape[0] > AUX_MEAN_MAX_ROWS:
-            return streams.mean(dim=1)
+            return sglang_ops.stream_mean(streams, out=out)
         self._log_served(
             "DSpark capture mean on the mHC stats stream", streams.shape[0]
         )
-        main = torch.cuda.current_stream()
         streams.record_stream(stream)
+        out.record_stream(stream)
         with torch.cuda.stream(stream):
-            mean = streams.mean(dim=1)
+            mean = sglang_ops.stream_mean(streams, out=out)
             done = torch.cuda.Event()
             done.record()
-        mean.record_stream(main)
         st.aux_done.append(done)
         return mean
 

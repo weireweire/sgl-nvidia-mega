@@ -76,6 +76,13 @@ class DraftProposal:
         self.draft_sampler: Optional[Callable] = (
             self._draft_sampler if "markov" in slots else None
         )
+        # each requested draft slot, built or declined (DraftDecode adds its forward's)
+        self.slot_states = {}
+        if "draft" not in slots:
+            from sgl_nvidia_mega.deepseek_v41 import draft_slots
+
+            self.slot_states = draft_slots.states(self, slots)
+            draft_slots.warn_declined(self.slot_states)
 
     def _draft_sampler(self, **buffers) -> Callable[[int], Optional[Callable]]:
         from sgl_nvidia_mega.deepseek_v41 import sampler
@@ -89,12 +96,18 @@ class DraftProposal:
         return steps.get
 
     def summary(self) -> str:
+        from sgl_nvidia_mega.deepseek_v41 import draft_slots
+
+        slots = f"; draft slots: {draft_slots.summary(self.slot_states)}"
         if self.draft_sampler is None:
-            return "DSpark draft: SGLang's proposal (markov slot off)"
+            return "DSpark draft: SGLang's proposal (markov slot off)" + slots
         lm_head = "low-M" if self.low_m else "SGLang's"
         if self.mxfp8:
             lm_head += " (MXFP8 stream at 1-8 rows, measurement only)"
-        return f"DSpark draft proposal: Markov chain in one kernel, LM head {lm_head}"
+        return (
+            f"DSpark draft proposal: Markov chain in one kernel, LM head {lm_head}"
+            + slots
+        )
 
     def plan(self, input_ids, forward_batch, *args, **kwargs):
         return None

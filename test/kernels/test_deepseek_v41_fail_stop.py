@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Fail-stop waits on 4 SM100-family GPUs (GB300): when one rank never joins, the ranks
 that wait on it fault within their deadline instead of hanging: the Lamport consumer of
-the wo_b publish (1-8 rows), also with its RMSNorm sums on mbarriers (slot hop_mbar), and
-the two-shot hop (49-384 rows), whose deadline comes from its build alone.
+the wo_b publish (1-8 rows), also with its RMSNorm sums on mbarriers (slot hop_mbar),
+the two-shot hop (49-384 rows), whose deadline comes from its build alone, and the
+draft's MoE post on its own mailbox (slot draft_hop).
 
 Each case runs its own torchrun, since a faulted rank leaves its CUDA context unusable.
 Run with ``python test/kernels/test_deepseek_v41_fail_stop.py``.
@@ -50,6 +51,24 @@ HOP_FAULT_WORKER = textwrap.dedent(
             return hop(x, torch.randn(rows, HC, H, device=dev).bfloat16(),
                        torch.rand(rows, HC, device=dev), torch.rand(rows, HC, HC, device=dev),
                        torch.rand(rows, HC, device=dev), torch.randn(H, device=dev).bfloat16(), 1e-6)
+    elif case == "draft_hop":
+        # the draft's mailbox as draft_hop.build makes it; its deadline is the build's
+        from types import SimpleNamespace
+        from sgl_nvidia_mega.deepseek_v41.boundary import draft_hop
+        stage = SimpleNamespace(hc_cfg=SimpleNamespace(hidden=H, mult=HC),
+            self_attn=SimpleNamespace(wo_b=SimpleNamespace(weight=torch.empty(1, device=dev))))
+        hop = draft_hop.DraftHop(draft_hop._mailbox(stage, 3, tp, deadline, 48))
+        rows = 5
+        def run():
+            # the draft MoE post: finalize, streams only
+            idx = torch.arange(rows * 3, device=dev, dtype=torch.int32).view(rows, 3)
+            return hop.finalize(torch.randn(rows * 3, H, device=dev).bfloat16(),
+                                torch.rand(rows, 3, device=dev), idx,
+                                torch.randn(rows, H, device=dev).bfloat16(),
+                                torch.randn(rows, HC, H, device=dev).bfloat16(),
+                                torch.rand(rows, HC, device=dev),
+                                torch.rand(rows, HC, HC, device=dev), None, None, 0.0,
+                                rows=rows)
     elif case == "two_shot":
         # no set_wait_deadline: the hop's deadline is its build argument only
         from sgl_nvidia_mega.deepseek_v41.sm103.two_shot_mhc import TwoShotMHC
@@ -88,7 +107,7 @@ def _gpu4() -> bool:
 
 
 @pytest.mark.skipif(not _gpu4(), reason="needs 4 SM100-family GPUs")
-@pytest.mark.parametrize("case", ["lamport", "lamport_mbar", "two_shot"])
+@pytest.mark.parametrize("case", ["lamport", "lamport_mbar", "two_shot", "draft_hop"])
 def test_a_missing_rank_faults_its_hop_peers_in_time(case, tmp_path):
     script = tmp_path / "worker.py"
     script.write_text(HOP_FAULT_WORKER)

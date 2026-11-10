@@ -10,11 +10,11 @@
 // Collapses three launches on the DSV4 decode/verify path (fused_rope_inplace,
 // _wo_a_partial, _wo_a_reduce_quant) into one cluster-launched kernel.
 //
-//   x [T, 2, 4096] bf16 (a strided view of a [T, 64, 512] attention output)
-//   W [2, 1024, 4096] bf16
-//   -> q [T, 2048] e4m3 + scales [8192] ue8m0, and/or y [T, 2048] bf16
+//   x [T, G, 4096] bf16 (a strided view of a [T, 64, 512] attention output)
+//   W [G, 1024, 4096] bf16, G = 2 local groups at TP4, 1 at TP8
+//   -> q [T, G * 1024] e4m3 + scales [G * 4096] ue8m0, and/or y [T, G * 1024] bf16
 //
-// Decomposition: the 2048 output columns split into 32 N-tiles of 64, one per
+// Decomposition: the G * 1024 output columns split into G * 16 N-tiles of 64, one per
 // cluster; K splits 8 ways across the cluster's CTAs, so each CTA owns exactly
 // one of the group's 8 heads -- and therefore exactly one 64-wide RoPE window,
 // which is exactly one staged K-tile. That is what folds the rope launch in
@@ -24,12 +24,12 @@
 // axis is the 16 tokens. Tokens as M would pad 8x and blow the A operand up to
 // 64xK, as large as the weights themselves.
 //
-// One variant per compile, chosen by -D: WO_A_MAX_TOKENS (16/32/48), WO_A_POS_INT64,
+// One variant per compile, chosen by -D: WO_A_MAX_TOKENS (16/32/48), WO_A_GROUPS (1/2), WO_A_POS_INT64,
 // WO_A_EARLY_TRIGGER, WO_A_ROW_TILE_SCALES, and WO_A_SMEM_BYTES (the launcher's
 // dynamic shared memory, checked against sizeof(Smem)). Entry: dsv41_wo_a_fused.
 
 #if !defined(WO_A_MAX_TOKENS) || !defined(WO_A_POS_INT64) || !defined(WO_A_EARLY_TRIGGER) || \
-    !defined(WO_A_ROW_TILE_SCALES) || !defined(WO_A_SMEM_BYTES)
+    !defined(WO_A_ROW_TILE_SCALES) || !defined(WO_A_SMEM_BYTES) || !defined(WO_A_GROUPS)
 #error "wo_a_fused.cu: the launcher passes every WO_A_* variant macro"
 #endif
 
@@ -412,18 +412,20 @@ namespace sglang::wo_a_fused {
 // Shape
 // ---------------------------------------------------------------------------
 /**
- * \brief Compile-time shape for the TP4 WO-A decomposition.
+ * \brief Compile-time shape for the WO-A decomposition.
  *
  * \tparam kMaxTokens Token capacity; also the MMA's N axis, so a multiple of 8.
  *         At 48 the epilogue inbox shares the activation tiles' smem (see kInboxInX).
+ * \tparam kGroups    Local o_groups: 2 at TP4, 1 at TP8.
  *
- * 2048 output columns split into kClusters N-tiles of kNTile, one per cluster;
+ * kGroups x 1024 output columns split into kClusters N-tiles of kNTile, one per cluster;
  * K splits kSplitK ways across the cluster's CTAs, giving each CTA exactly one
  * of the group's 8 heads and therefore exactly one RoPE window.
  */
-template <int kMaxTokens>
+template <int kMaxTokens, int kGroups = 2>
 struct WoATrait {
   static_assert(kMaxTokens == 16 || kMaxTokens == 32 || kMaxTokens == 48, "only x16/x32/x32+x16 TMEM loads are wired up");
+  static_assert(kGroups == 1 || kGroups == 2, "TP8 (1 local group) and TP4 (2) only");
 
   static constexpr int kMMax = kMaxTokens;
   static constexpr int kNTile = 64;  // == 2 MXFP8 blocks
@@ -436,7 +438,7 @@ struct WoATrait {
   static constexpr int kHeadStages = kHeadDim / kBlockK;
   static constexpr int kHeadsPerCta = kKSlab / kHeadDim;
   static constexpr int kRopeDim = 64;
-  static constexpr int kNOut = 2048;  // 2 groups x 1024
+  static constexpr int kNOut = kGroups * 1024;
   // One UE8M0 byte per MXFP8 block, for 128 padded token rows.
   static constexpr int kScaleBytes = (kNOut / 32) * 128;
   static constexpr int kClusters = kNOut / kNTile;
@@ -550,9 +552,9 @@ SGL_DEVICE void wo_a_fused_kernel(
     const CUtensorMap& x_map,
     const float* __restrict__ freqs,     // [S, 64] fp32, (cos0, sin0, cos1, ...)
     const PosT* __restrict__ positions,  // [T] int32 or int64
-    fp8_e4m3_t* __restrict__ q,          // [T, 2048], may be null
-    uint8_t* __restrict__ scales_out,    // [8192], may be null when q is
-    bf16_t* __restrict__ y,              // [T, 2048], may be null
+    fp8_e4m3_t* __restrict__ q,          // [T, kNOut], may be null
+    uint8_t* __restrict__ scales_out,    // [kNOut * 4], may be null when q is
+    bf16_t* __restrict__ y,              // [T, kNOut], may be null
     uint32_t m) {
   using namespace device;
   // The trait's shape, unqualified, so the body below reads as plain constants.
@@ -860,7 +862,7 @@ SGL_DEVICE void wo_a_fused_kernel(
 }  // namespace sglang::wo_a_fused
 
 namespace {
-using Trait = sglang::wo_a_fused::WoATrait<WO_A_MAX_TOKENS>;
+using Trait = sglang::wo_a_fused::WoATrait<WO_A_MAX_TOKENS, WO_A_GROUPS>;
 #if WO_A_POS_INT64
 using PosT = int64_t;
 #else

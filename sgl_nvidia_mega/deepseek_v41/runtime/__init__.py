@@ -98,7 +98,11 @@ DRAFT_SLOTS = frozenset(
 # lm_head_pinned_tactic: the low-M LM heads on one fixed tactic per row count, untuned;
 # attn_indexer_narrow: slot attn_indexer at the swap-AB widths too (1-24 rows);
 # attn_indexer_fused: that, and the candidate consumers' logits + top-k at 1-8 rows in
-# one cluster launch, sm103/attention/reindex_select.py)
+# one cluster launch, sm103/attention/reindex_select.py;
+# swapab_h8 / wo_a_g1: at attention TP8, swap-AB on the 8 local heads and the fused wo_a
+# on the 1 local group, target and draft, in place of SGLang's FlashMLA and einsum, which
+# TP8 runs (each bitwise to its TP4 kernel on the same heads / group, not to SGLang's
+# TP8 arm); no effect at TP4)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -107,6 +111,8 @@ OPT_IN_SLOTS = (
     "lm_head_pinned_tactic",
     "attn_indexer_narrow",
     "attn_indexer_fused",
+    "swapab_h8",
+    "wo_a_g1",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -180,6 +186,8 @@ def slot_reasons() -> list[str]:
         ("draft_prenorm", "draft"),
         ("draft_qkv_a_ll", "draft_qkv_a"),
         ("draft_wo_b_ll", "draft_wo_a"),
+        ("swapab_h8", "attn"),
+        ("wo_a_g1", "attn"),
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")

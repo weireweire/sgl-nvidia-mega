@@ -156,6 +156,8 @@ class AttentionStep:
         qkv_a_bf16: bool = False,
         index_q_mxfp8_in: bool = False,
         kv_before_wait: bool = False,
+        swapab_h8: bool = False,
+        wo_a_g1: bool = False,
     ):
         self.attn = attn
         # swap-AB gathers the KV before its PDL wait on the low-ratio prepare (slot
@@ -175,7 +177,10 @@ class AttentionStep:
                 )
                 for rope in (False, True)
             )
-        self.swapab = chain_ops and chain.swapab_applies(attn)
+        # slot swapab_h8: swap-AB on attention TP8's 8 local heads
+        self.swapab = chain_ops and chain.swapab_applies(attn, heads8=swapab_h8)
+        # slot wo_a_g1: the fused wo_a on attention TP8's 1 local group
+        self.fused_wo_a = chain_ops and chain.fused_wo_a_applies(attn, wo_a_g1)
         # fp32 [positions, 64]: cos, sin interleaved, as the swap-AB query RoPE reads them
         self.freqs = (
             torch.view_as_real(attn.freqs_cis).flatten(-2).contiguous()
@@ -251,6 +256,7 @@ class AttentionStep:
         """The layer's TP-partial attention output (``mhc.AttnOutput``) for input
         ``x`` (``x_quant``: the same input as MXFP8); ``publish``: see ``ops.wo_b``."""
         attn = self.attn
+        fused = self.fused_wo_a
         assert not view.kv_pool.uniform_fp8, "the uniform-FP8 pool"
         rows = x.shape[0]
         use_chain = self.chain is not None and rows <= chain.NORM_QUANT_MAX_ROWS
@@ -268,7 +274,9 @@ class AttentionStep:
                 )
                 tiles = _publish_row_tiles(rows, publish)
                 return ops.wo_b(
-                    attn, chain.wo_a(attn, o, positions, fb, tiles), publish
+                    attn,
+                    chain.wo_a(attn, o, positions, fb, tiles, fused=fused),
+                    publish,
                 )
             heads, q_padded, q_out, tp_slice = self._query_buffer(x, view)
             attn_sink = attn._local_attn_sink(heads)
@@ -288,7 +296,9 @@ class AttentionStep:
             if use_chain:
                 tiles = _publish_row_tiles(rows, publish)
                 return ops.wo_b(
-                    attn, chain.wo_a(attn, o, positions, fb, tiles), publish
+                    attn,
+                    chain.wo_a(attn, o, positions, fb, tiles, fused=fused),
+                    publish,
                 )
             return ops.wo_b(attn, ops.wo_a(attn, o, positions, fb), publish)
 

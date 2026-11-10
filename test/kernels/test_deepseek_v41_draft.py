@@ -12,10 +12,16 @@
   logits, local-shard and full-vocab base logits, three launches and a CUDA graph
   replay with the noise forked onto its side stream. Rows at temperature 0 leave their
   step logits untouched. A missing rank's fault is in test_deepseek_v41_fail_stop.py.
+- The same on every rank of a torchrun job (world 2, 4 or 8; world 8 is attention TP8 on
+  two GB300 trays, whose narrow kernel serves 1-4 rows and the wide kernel 8).
+- The low-M LM head on the TP8 shard (N 16160) too, and the pinned tactics of both
+  shards are offered.
 
-Run with ``python -m pytest test/kernels/test_deepseek_v41_draft.py -s``.
+Run with ``python -m pytest test/kernels/test_deepseek_v41_draft.py -s``; the ranks'
+cases with ``torchrun --nnodes 2 --nproc_per_node 4 ... -m pytest -k ranks ...``.
 """
 
+import os
 import sys
 from types import SimpleNamespace
 
@@ -34,13 +40,14 @@ needs_lm_head = pytest.mark.skipif(
 )
 
 N, K = 32320, 5120
+N_TP8 = 16160  # 129280 / 8
 ROWS = (5, 10, 15, 16)
 
 
-@pytest.fixture(scope="module")
-def head():
+@pytest.fixture(scope="module", params=[N, N_TP8], ids=["tp4", "tp8"])
+def head(request):
     torch.manual_seed(0)
-    weight = (torch.randn(N, K, device="cuda") * 0.02).to(torch.bfloat16)
+    weight = (torch.randn(request.param, K, device="cuda") * 0.02).to(torch.bfloat16)
     lm_head = sampler.DraftLmHead(SimpleNamespace(weight=weight), low_m=True)
     assert lm_head.low_m, "FlashInfer cute-dsl mm_bf16 is unavailable"
     lm_head.tune(ROWS)
@@ -75,7 +82,7 @@ def test_low_m_logits_are_the_bf16_projection_within_the_bound(head, rows):
     weight = head.lm_head.weight
     want = torch.matmul(x, weight.T).float()
     got = head(x)
-    assert got.dtype == torch.bfloat16 and got.shape == (rows, N)
+    assert got.dtype == torch.bfloat16 and got.shape == (rows, weight.shape[0])
     got = got.float()
     rel = ((got - want).abs().max() / want.abs().max()).item()
     assert rel <= sampler.LM_HEAD_LOGITS_REL, rel
@@ -89,6 +96,35 @@ def test_low_m_logits_are_the_bf16_projection_within_the_bound(head, rows):
         f"low-M {_us(lambda: head(x)):.1f} us, "
         f"cuBLAS {_us(lambda: torch.matmul(x, weight.T)):.1f} us"
     )
+
+
+@needs_lm_head
+@pytest.mark.parametrize("n", [N, N_TP8], ids=["tp4", "tp8"])
+def test_pinned_lm_head_tactics_are_offered_and_bitwise_stable(n):
+    """Slot lm_head_pinned_tactic on each shard: every pinned row count gets its tactic
+    (not FlashInfer's default), within the low-M bound, and the same bits per launch."""
+    from sgl_nvidia_mega.deepseek_v41.sampler import pinned
+
+    major, minor = torch.cuda.get_device_capability()
+    sm = major * 10 + minor
+    rows_pinned = sorted(
+        r for (s, nn, k, r) in pinned.PINNED_TACTICS if (s, nn, k) == (sm, n, K)
+    )
+    if not rows_pinned:
+        pytest.skip(f"no pinned LM-head tactics for SM {sm} N {n}")
+    torch.manual_seed(1)
+    weight = (torch.randn(n, K, device="cuda") * 0.02).to(torch.bfloat16)
+    for rows in rows_pinned:
+        runner, tactic = pinned._choice(sm, n, K, rows, torch.device("cuda"))
+        assert (type(runner).__name__, tuple(tactic)) == pinned.PINNED_TACTICS[
+            sm, n, K, rows
+        ], rows
+        x = torch.randn(rows, K, device="cuda").to(torch.bfloat16)
+        got = pinned.pinned_mm(x, weight.t())
+        assert torch.equal(got, pinned.pinned_mm(x, weight.t())), rows
+        want = torch.matmul(x, weight.T).float()
+        rel = ((got.float() - want).abs().max() / want.abs().max()).item()
+        assert rel <= sampler.LM_HEAD_LOGITS_REL, (rows, rel)
 
 
 # ----------------------------------------------------------------- sharded Markov chain
@@ -263,6 +299,35 @@ def _check_forked_graph(device, chain, w1, w2, shard, base_dtype, g):
 @pytest.mark.parametrize("base_dtype", [torch.bfloat16, torch.float32])
 def test_one_rank_matches_markov_sample_step(base_dtype):
     _check_equal(torch.device("cuda"), None, 0, 1, base_dtype, seed=1)
+
+
+_TORCHRUN = "RANK" in os.environ and int(os.environ.get("WORLD_SIZE", "1")) > 1
+
+
+@pytest.fixture(scope="module")
+def ranks():
+    """This torchrun rank's device and CPU group (one process group per module)."""
+    import torch.distributed as dist
+
+    world, rank = int(os.environ["WORLD_SIZE"]), int(os.environ["RANK"])
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(device)
+    dist.init_process_group("cpu:gloo,cuda:nccl", rank=rank, world_size=world)
+    group = dist.new_group(list(range(world)), backend="gloo")
+    yield device, group, rank, world
+    dist.barrier(group=group)
+    dist.destroy_process_group()
+
+
+@needs_gpu
+@pytest.mark.skipif(not _TORCHRUN, reason="runs on every rank of a torchrun job")
+@pytest.mark.parametrize("base_dtype", [torch.bfloat16, torch.float32])
+def test_ranks_match_markov_sample_step(ranks, base_dtype):
+    """Every rank's sharded chain draws SGLang's tokens and keeps its full-vocab step
+    logits; the same seed on every rank, so all ranks agree on the reference."""
+    device, group, rank, world = ranks
+    assert world in markov.SUPPORTED_WORLDS
+    _check_equal(device, group, rank, world, base_dtype, seed=2)
 
 
 if __name__ == "__main__":

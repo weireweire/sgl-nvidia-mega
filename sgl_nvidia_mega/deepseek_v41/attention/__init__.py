@@ -78,6 +78,8 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
             qkv_a_bf16=qkv_a_bf16,
             index_q_mxfp8_in=chain_on and "index_q_mxfp8_in" in SLOTS,
             kv_before_wait="kv_before_wait" in SLOTS,
+            swapab_h8="swapab_h8" in SLOTS,
+            wo_a_g1="wo_a_g1" in SLOTS,
         )
         if chain_on:
             ops0 = step_.chain[0]
@@ -89,7 +91,9 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
                 ops0.indexer = step_indexer
                 if narrow_indexer:
                     step_.chain[1].indexer = step_indexer
-            chain.precompile(attn, ctx.widths, qkv_a_ll=qkv_a_ll)
+            chain.precompile(
+                attn, ctx.widths, qkv_a_ll=qkv_a_ll, wo_a_one_group="wo_a_g1" in SLOTS
+            )
             kinds[_chain_kind(attn, step_)] += 1
     logger.info(
         "NVIDIA megakernel: attention step in %d layers (%s)%s",
@@ -117,11 +121,17 @@ def _chain_kind(attn, step_: AttentionStep) -> str:
             + (", fused consumers 1-8" if step_.chain[0].indexer.fused else "")
         )
     parts.append("wq_b low-latency 1-48" if step_.chain[0].wq_b_ll else "wq_b SGLang's")
-    swapab = "swap-AB 1-24" if step_.swapab else "no swap-AB"
+    swapab = (
+        f"swap-AB 1-24 ({attn.n_local_heads} heads)" if step_.swapab else "no swap-AB"
+    )
     if step_.swapab and step_.kv_before_wait and step_.low_ratio:
         swapab += " (KV before the PDL wait)"
     parts.append(swapab)
-    parts.append("fused wo_a 1-48" if attn.use_fused_wo_a else "wo_a SGLang's")
+    parts.append(
+        f"fused wo_a 1-48 ({attn.n_local_groups} groups)"
+        if step_.fused_wo_a
+        else "wo_a SGLang's"
+    )
     return ", ".join(parts)
 
 

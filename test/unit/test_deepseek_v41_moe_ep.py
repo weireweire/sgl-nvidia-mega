@@ -112,3 +112,54 @@ def test_shared_ll_takes_the_tp8_shard(n, ok):
         why = shared_ll.why_not(_mlp(n))
     assert (why == "") == ok, why
 
+
+def _boundary_layer(sglang_fuses: bool, *, shared_tp1=False):
+    return SimpleNamespace(
+        boundary_pre_from_prev=True,
+        _can_fuse_attn_mhc=sglang_fuses,
+        _can_fuse_ffn_mhc=sglang_fuses,
+        post_attention_layernorm=None,
+        ffn_hc=None,
+        hc_cfg=None,
+        self_attn=SimpleNamespace(attn_tp_size=8),
+        mlp=SimpleNamespace(_shared_expert_tp1=shared_tp1),
+    )
+
+
+@pytest.mark.parametrize(
+    "tp, ep, sglang_fuses, shared_tp1, want",
+    [
+        (4, 1, True, False, True),  # TP4: SGLang's own gate, unchanged
+        (4, 1, False, False, False),
+        (8, 2, False, False, True),  # TP8 + EP2: SGLang's gate less its TP list
+        (8, 2, False, True, False),  # a replicated shared expert keeps it off
+        (8, 1, False, False, False),
+    ],
+)
+def test_the_post_gate_admits_tp8_ep2_only(tp, ep, sglang_fuses, shared_tp1, want):
+    from sgl_nvidia_mega.deepseek_v41.boundary import boundaries
+
+    parallel = SimpleNamespace(tp_size=tp, moe_ep_size=ep)
+    with (
+        mock.patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
+        mock.patch(
+            "sglang.srt.layers.moe.get_moe_a2a_backend",
+            return_value=SimpleNamespace(is_none=lambda: True),
+        ),
+        mock.patch(
+            "sglang.srt.layers.moe.utils.should_skip_post_experts_all_reduce",
+            return_value=False,
+        ),
+        mock.patch(
+            "sglang.srt.models.deepseek_v4_mhc.can_fuse_post", return_value=True
+        ),
+        mock.patch(
+            "sglang.srt.models.deepseek_v4_mhc.make_boundary",
+            return_value=SimpleNamespace(norm_fusable=True),
+        ),
+    ):
+        layer = _boundary_layer(sglang_fuses, shared_tp1=shared_tp1)
+        assert boundaries._fusable(layer, "ffn", True) is want
+        if not shared_tp1:
+            assert boundaries._fusable(layer, "attn", True) is want
+        assert boundaries._fusable(layer, "ffn", False) is False

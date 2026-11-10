@@ -54,6 +54,7 @@ SGLANG_READS = {
         "is_deferred_finalize",
         "norm",
         "norm_fusable",
+        "can_fuse_post",
         "accepts_mxfp8",
         "fork_stats_stream",
         "combine",
@@ -79,12 +80,14 @@ SGLANG_READS = {
         "engram",
         "_can_fuse_attn_mhc",
         "_can_fuse_ffn_mhc",
+        "self_attn",
         # the module alias SGLang's DSV4 model imports too
         "mhc",
     ),
     "srt/layers/quantization/mxfp4_flashinfer_trtllm_moe.py": ("can_fuse_all_reduce",),
     "srt/models/deepseek_v2.py": (
         "tp_size",
+        "_shared_expert_tp1",
         "MoEOutput",
         "routed",
         "shared",
@@ -97,7 +100,14 @@ SGLANG_READS = {
         "expert_weights",
         "top_k",
     ),
-    "srt/runtime_context.py": ("get_parallel", '"attn_tp_group"'),
+    "srt/runtime_context.py": (
+        "get_parallel",
+        '"attn_tp_group"',
+        '"tp_size"',
+        '"moe_ep_size"',
+    ),
+    "srt/layers/moe/__init__.py": ("get_moe_a2a_backend",),
+    "srt/layers/moe/utils.py": ("should_skip_post_experts_all_reduce",),
 }
 
 
@@ -522,9 +532,44 @@ def _quantizes(nxt, rows: int) -> bool:
 
 
 def _fusable(layer, kind: str, fuses: bool) -> bool:
-    """The static half of SGLang's fusion gate (load-time facts of the layer)."""
+    """The static half of SGLang's fusion gate (load-time facts of the layer); at TP8
+    (MoE TP4 x EP2), where SGLang has no fused all-reduce + mHC kernels, the same
+    gate without its world-size check, so the plugin's own hops serve the posts."""
     fusable = layer._can_fuse_attn_mhc if _attention(kind) else layer._can_fuse_ffn_mhc
-    return fuses and layer.boundary_pre_from_prev and fusable
+    return (
+        fuses
+        and layer.boundary_pre_from_prev
+        and (fusable or _tp8_ep2_fusable(layer, kind))
+    )
+
+
+def _tp8_ep2_fusable(layer, kind: str) -> bool:
+    """SGLang's ``_can_fuse_attn_mhc`` / ``_can_fuse_ffn_mhc`` at TP8 with EP2, less
+    ``fused_mhc_tp_ok`` (TP2 / TP4 only): the EP and MoE-TP sums merge into one TP
+    all-reduce (moe_dp_size 1), which the hops run over the 8 ranks."""
+    from sglang.srt.layers.moe import get_moe_a2a_backend
+    from sglang.srt.layers.moe.utils import should_skip_post_experts_all_reduce
+    from sglang.srt.models import deepseek_v4_mhc as mhc
+    from sglang.srt.runtime_context import get_parallel
+
+    parallel = get_parallel()
+    if (parallel.tp_size, parallel.moe_ep_size) != (8, 2):
+        return False
+    if _attention(kind):
+        boundary = mhc.make_boundary(
+            layer.post_attention_layernorm, accepts_mxfp8=False, hc=layer.ffn_hc
+        )
+        return (
+            parallel.tp_size == layer.self_attn.attn_tp_size
+            and boundary.norm_fusable
+            and mhc.can_fuse_post(layer.hc_cfg)
+        )
+    return (
+        get_moe_a2a_backend().is_none()
+        and not layer.mlp._shared_expert_tp1
+        and not should_skip_post_experts_all_reduce(is_tp_path=True)
+        and mhc.can_fuse_post(layer.hc_cfg)
+    )
 
 
 def _mxfp8_buffers(weights, streams, scale_bytes):

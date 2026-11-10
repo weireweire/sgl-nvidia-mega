@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """DeepSeek-V4.1 hop B, the MoE finalize into the Lamport all-reduce + mHC, and hop A on
-the same instance, on 4 SM100-family GPUs (GB300) with NVLink multicast, at 1-8 rows.
+the same instance, on 4 SM100-family GPUs (GB300) with NVLink multicast, at 1-8 rows; on
+8 (two trays, TP8) also with the routes of MoE TP4 x EP2, where each slot is held by the
+four ranks of one EP half and dropped (-1) by the other four.
 
 - ``AllReduceMHC.finalize`` with MXFP8 output and residual-only against SGLang's
   one-shot push kernels (streams, normalized row, MXFP8 values and scales), and its
@@ -10,7 +12,8 @@ the same instance, on 4 SM100-family GPUs (GB300) with NVLink multicast, at 1-8 
   from a replayed CUDA graph, stay bitwise stable and match torch.
 
 It registers its own SGLang one-shot plane, so it keeps its own process. Run with
-``python test/kernels/test_deepseek_v41_hop_b.py --num-gpu 4 -s``.
+``python test/kernels/test_deepseek_v41_hop_b.py --num-gpu 4 -s``; at TP8 under a
+two-node torchrun (``--nnodes 2 --nproc-per-node 4 -m pytest <file> -s``).
 """
 
 import os
@@ -26,6 +29,7 @@ from sglang.test.test_utils import publish_build_topology
 from sgl_nvidia_mega.deepseek_v41.spec import NUMERICS
 
 HIDDEN, HC, TOP_K, EPS = 5120, 4, 6, 1e-6
+EXPERTS, EP = 384, 2
 ROWS = tuple(range(1, 9))
 
 
@@ -126,15 +130,20 @@ def env():
     ps.destroy_distributed_environment()
 
 
-def _inputs(rows, seed, rank, device, shared_zero=False):
+def _inputs(rows, seed, rank, device, shared_zero=False, ep_of=None):
     """One hop's inputs: routing, mixes and norm weight equal on every rank (as in
     TP), GEMM2 rows, shared expert and hop A's x per rank; ~15% of a rank's routes
-    point at an expert it does not hold."""
+    point at an expert it does not hold, or with ``ep_of`` (rank -> EP rank) the
+    routes of the other EP half's experts."""
     common = torch.Generator().manual_seed(seed)
     local = torch.Generator().manual_seed(seed * 31 + rank + 1)
     padded = rows * TOP_K + 8
     perm = torch.randperm(padded, generator=common)[: rows * TOP_K].view(rows, TOP_K)
     held = torch.rand(rows, TOP_K, generator=local) >= 0.15
+    if ep_of is not None:
+        routed = torch.Generator().manual_seed(seed + 7919)
+        experts = torch.randint(0, EXPERTS, (rows, TOP_K), generator=routed)
+        held = experts // (EXPERTS // EP) == ep_of(rank)
     shared = torch.randn(rows, HIDDEN, generator=local) * 0.5
     tensors = dict(
         idx=torch.where(held, perm, -1).int(),
@@ -243,15 +252,31 @@ def _diff(a, b, scales=False):
     return (ulps == 0).float().mean().item(), ulps_big, abs_err
 
 
+def _ep_of(tp):
+    """MoE TP4 x EP2 at TP8: ranks 0-3 hold the first half of the experts."""
+    return lambda rank: rank // (tp // EP)
+
+
 @torch.inference_mode()
+@pytest.mark.parametrize("routing", ["random", "ep2"])
 @pytest.mark.parametrize("shared_zero", [False, True])
-def test_finalize_matches_sglang_one_shot(env, shared_zero):
+def test_finalize_matches_sglang_one_shot(env, shared_zero, routing):
     from flashinfer import mxfp8_quantize
 
+    if routing == "ep2" and env.tp != 8:
+        pytest.skip("MoE TP4 x EP2 is a TP8 layout")
+    ep_of = _ep_of(env.tp) if routing == "ep2" else None
     hop = env.hops["end"]
     worst = {}
     for rows in ROWS:
-        inp = _inputs(rows, 100 + rows, env.rank, env.device, shared_zero)
+        inp = _inputs(rows, 100 + rows, env.rank, env.device, shared_zero, ep_of)
+        if ep_of is not None:
+            # the EP pair (rank, rank + 4) holds every slot exactly once
+            held = (inp.idx >= 0).int()
+            pair = [torch.empty_like(held) for _ in range(env.tp)]
+            dist.all_gather(pair, held, group=env.group)
+            peer = (env.rank + env.tp // EP) % env.tp
+            assert torch.equal(held + pair[peer], torch.ones_like(held))
         streams, normed, values, scales = _run(hop, "quant", inp)
         # The MXFP8 output is FlashInfer's quantize of the BF16 row, bit for bit.
         fi_values, fi_scales = mxfp8_quantize(normed, is_sf_swizzled_layout=True)
@@ -276,8 +301,8 @@ def test_finalize_matches_sglang_one_shot(env, shared_zero):
         }
         for name, (equal, ulps, abs_err) in stats.items():
             print(
-                f"HOPB r{env.rank} sglang shared_zero={shared_zero} rows={rows} "
-                f"{name}: equal={equal:.6f} max_ulp={ulps} max_abs={abs_err:.4g}"
+                f"HOPB r{env.rank} {routing} sglang shared_zero={shared_zero} "
+                f"rows={rows} {name}: equal={equal:.6f} max_ulp={ulps} max_abs={abs_err:.4g}"
             )
             prev = worst.get(name, (1.0, 0, 0.0))
             worst[name] = (
@@ -285,7 +310,7 @@ def test_finalize_matches_sglang_one_shot(env, shared_zero):
                 max(prev[1], ulps),
                 max(prev[2], abs_err),
             )
-    print(f"HOPB r{env.rank} sglang shared_zero={shared_zero} worst={worst}")
+    print(f"HOPB r{env.rank} {routing} sglang shared_zero={shared_zero} worst={worst}")
     # The mHC post rounds one product in another order than SGLang's: a few
     # stream values per 10^5 differ by an ULP, which moves their row's RMS.
     assert worst["streams"][0] >= 0.9999, worst

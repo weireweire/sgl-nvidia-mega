@@ -14,7 +14,9 @@ LAYOUT = KVLayout.V4
 MAX_BATCH = 8
 # Each (row, KV tile) is its own CTA, so rows past MAX_BATCH are a caller's dispatch choice.
 WIDE_MAX_BATCH = 64
-NUM_HEADS = 16
+NUM_HEADS = 16  # the MMA's head columns
+# Local query heads served: 16 at attention TP4, 8 at TP8 (padded to 16 in the MMA)
+HEAD_COUNTS = (8, 16)
 HEAD_DIM = 512
 # With pdl, trigger the next kernel (wo_a_fused streams its weights before its wait) right
 # after the wait, not after the loads: faster in 7 of 9 GB300 micro-bench cases at 6-24 rows.
@@ -94,7 +96,7 @@ def swapab_attention(
     kv_before_wait=False,
     combine_entry_trigger=False,
 ):
-    """V4-layout attention on 16 heads; `extra_*` is a second slot range appended
+    """V4-layout attention on 16 (TP4) or 8 (TP8) heads; `extra_*` is a second slot range appended
     to each request's keys, and the attention sink is folded in exactly once.
     `pdl` launches both kernels as programmatic dependents; `narrow_combine` runs the
     combine as one-warp programs over 128 columns. `q_rope` = (fp32 [pos, 64] freqs,
@@ -106,7 +108,7 @@ def swapab_attention(
     block = 64
     b, h, d = q.shape[0], q.shape[-2], q.shape[-1]
     assert q.ndim in (3, 4) and (q.ndim == 3 or q.shape[1] == 1)
-    assert 0 < b <= min(max_rows, WIDE_MAX_BATCH) and h == NUM_HEADS and d == HEAD_DIM
+    assert 0 < b <= min(max_rows, WIDE_MAX_BATCH) and h in HEAD_COUNTS and d == HEAD_DIM
     assert q.dtype == torch.bfloat16 and q.stride(-1) == 1
     assert kv.shape[-1] == LAYOUT.bytes_per_token
     assert kv.dtype in (torch.uint8, torch.float8_e4m3fn)
@@ -153,7 +155,7 @@ def swapab_attention(
         NT=nt,
         KT=kt,
         BT=block,
-        H=h,
+        H=NUM_HEADS,
         SCALE=SOFTMAX_SCALE,
         KTOKENS=kv.shape[0] * kv.shape[1],
         ETOKENS=extra_kv.shape[0] * extra_kv.shape[1],
@@ -166,6 +168,7 @@ def swapab_attention(
         **({"USE_GDC": True, "launch_pdl": True} if pdl else {}),
         **(_q_rope_kwargs(q_rope, b) if q_rope is not None else {}),
         **({"KV_BEFORE_WAIT": True} if pdl and kv_before_wait else {}),
+        **({"HQ": h} if h != NUM_HEADS else {}),
     )
     bd = 64 if ne else 512
     combine_warps = 4

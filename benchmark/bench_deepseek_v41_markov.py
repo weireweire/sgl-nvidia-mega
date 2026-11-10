@@ -10,6 +10,9 @@ launch follows a write of 2x the L2 size (serving runs the whole model between t
 chains); a graph of the writes alone is replayed too and subtracted per replay.
 
   python benchmark/bench_deepseek_v41_markov.py --world 4 --rows 1,2,4,8,16,32,64
+
+Under torchrun (RANK / WORLD_SIZE set, e.g. world 8 over two GB300 trays) every process
+is one rank and --world is ignored.
 """
 
 import argparse
@@ -31,9 +34,13 @@ KEY = 0x1234_5678_9ABC_DEF
 
 def _worker(rank: int, args) -> None:
     world = args.world
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(args.port)
-    device = torch.device("cuda", rank)
+    local_rank = rank
+    if args.torchrun:
+        local_rank = int(os.environ["LOCAL_RANK"])
+    else:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = str(args.port)
+    device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     group = None
     if world > 1:
@@ -149,6 +156,11 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--replays", type=int, default=200)
     args = parser.parse_args()
+    args.torchrun = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    if args.torchrun:
+        args.world = int(os.environ["WORLD_SIZE"])
+        _worker(int(os.environ["RANK"]), args)
+        return
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         args.port = s.getsockname()[1]

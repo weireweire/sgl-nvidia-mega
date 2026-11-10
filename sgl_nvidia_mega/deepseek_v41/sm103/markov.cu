@@ -120,6 +120,10 @@ static_assert(kThreads == kMaxSteps * kWideRows, "the wide kernel clears row_bes
 constexpr int kVectorElements = 16 / static_cast<int>(sizeof(CACHE_T));
 constexpr int kTileVectors = 16 / kVectorElements;
 
+// Without a programmatic launch this returns at once; with one (markov_pdl) it waits for
+// the producer grid. Nothing written by an earlier graph node is read before it.
+__device__ __forceinline__ void GridDependencyWait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+
 // Pull one embedding row (512 bytes) into L2.
 __device__ __forceinline__ void PrefetchRowL2(const __nv_bfloat16* row) {
 #pragma unroll
@@ -344,11 +348,12 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_narrow(
       }
     }
   };
-  load_inputs(0);
-
+  // The launch counter is this kernel's own (an earlier, completed launch wrote it).
   if (threadIdx.x == 0) {
     s_count = *reinterpret_cast<volatile u32*>(&control[kCountWord + blockIdx.x]);
   }
+  GridDependencyWait();
+  load_inputs(0);
 #if MARKOV_DIRECT
   if (threadIdx.x < kMaxSteps * kMaxRows) (&row_best[0][0])[threadIdx.x] = 0ull;
 #endif
@@ -690,11 +695,11 @@ extern "C" __global__ void __launch_bounds__(kThreads, 1) dsv41_markov_wide(
   };
   float base[2][2] = {{0.0F, 0.0F}, {0.0F, 0.0F}};
   float gumbel[2][2] = {{0.0F, 0.0F}, {0.0F, 0.0F}};
-  load_group(0, 0, base, gumbel);
-
   if (threadIdx.x == 0) {
     s_count = *reinterpret_cast<volatile u32*>(&control[kWideCountWord + blockIdx.x]);
   }
+  GridDependencyWait();
+  load_group(0, 0, base, gumbel);
   (&row_best[0][0])[threadIdx.x] = 0ull;
   for (int r = warp; r < kWideRows; r += kWarps) {
     uint4 value = make_uint4(0u, 0u, 0u, 0u);

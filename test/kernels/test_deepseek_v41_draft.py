@@ -265,5 +265,88 @@ def test_one_rank_matches_markov_sample_step(base_dtype):
     _check_equal(torch.device("cuda"), None, 0, 1, base_dtype, seed=1)
 
 
+def _pdl_chain(device, pdl: bool, seed: int, blocks: int, temps):
+    """``blocks`` draft blocks of one CUDA graph: the low-M LM head (FlashInfer's PDL
+    GEMM, the real producer) writes the base logits the chain reads, as the draft
+    proposal runs them; tokens and kept logits of every block."""
+    g = torch.Generator().manual_seed(seed)
+    vocab_local, hidden = VOCAB, 1024
+    w1, w2 = _ternary(g, device, VOCAB, RANK), _ternary(g, device, VOCAB, RANK)
+    chain = markov.ShardedMarkov(
+        embed_weight=w1,
+        head_weight=w2,
+        vocab_size=VOCAB,
+        num_steps=STEPS,
+        cache_dtype=torch.float32,
+        group=None,
+        rank=0,
+        world=1,
+        max_bs=1,
+        deadline_s=DEADLINE_S,
+        keeps_logits=True,
+        pdl=pdl,
+    )
+    weight = (torch.randn(vocab_local, hidden, generator=g) * 0.05).to(
+        device, torch.bfloat16
+    )
+    lm_head = sampler.DraftLmHead(SimpleNamespace(weight=weight), low_m=True)
+    lm_head.tune((STEPS,))
+    x = torch.zeros(STEPS, hidden, dtype=torch.bfloat16, device=device)
+    anchor = torch.zeros(1, dtype=torch.int64, device=device)
+    temperatures = torch.tensor(temps, device=device)
+    offset = torch.tensor([3], dtype=torch.int64, device=device)
+    cache = torch.zeros(1, STEPS, VOCAB, device=device)
+    tokens = torch.full((1, STEPS), -7, dtype=torch.int64, device=device)
+
+    def block():
+        if temps[0] != 0.0:
+            chain.fork_noise(rows=1, key=KEY, offset=offset)
+        if pdl:
+            chain.stage_anchor(anchor)
+        base = lm_head(x).view(1, STEPS, -1)
+        if temps[0] != 0.0:
+            chain.join_noise()
+        chain.sample(
+            base_logits=base,
+            anchor_tokens=anchor,
+            temperatures=temperatures,
+            logits_cache=cache if temps[0] != 0.0 else None,
+            draft_tokens=tokens,
+            anchor_staged=pdl,
+        )
+
+    side = torch.cuda.Stream(device)
+    side.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(side):
+        block()
+    torch.cuda.current_stream(device).wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        block()
+    out_tokens, out_logits = [], []
+    for i in range(blocks):
+        x.copy_((torch.randn(STEPS, hidden, generator=g) * 2).to(torch.bfloat16))
+        anchor.fill_(int(torch.randint(0, VOCAB, (1,), generator=g)))
+        offset.fill_(100 + i)
+        graph.replay()
+        out_tokens.append(tokens.clone())
+        out_logits.append(cache[0, :, ::997].clone())
+    torch.cuda.synchronize()
+    return torch.cat(out_tokens), torch.stack(out_logits)
+
+
+@needs_lm_head
+@pytest.mark.parametrize("temps", [(0.0,), (1.0,)], ids=["greedy", "sampled"])
+def test_markov_pdl_behind_the_low_m_lm_head_is_bitwise(temps):
+    """Slot markov_pdl: 300 graph-replayed blocks behind the real PDL producer give the
+    same tokens and kept logits as the plain launch."""
+    device = torch.device("cuda")
+    want = _pdl_chain(device, False, seed=11, blocks=300, temps=temps)
+    got = _pdl_chain(device, True, seed=11, blocks=300, temps=temps)
+    assert torch.equal(got[0], want[0])
+    assert torch.equal(got[1], want[1])
+    assert len(set(want[0][:, 0].tolist())) > 100  # the blocks differ
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q", "-p", "no:cacheprovider"]))

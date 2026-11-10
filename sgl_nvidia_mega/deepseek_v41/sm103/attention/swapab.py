@@ -22,6 +22,11 @@ HEAD_DIM = 512
 # after the wait, not after the loads: faster in 7 of 9 GB300 micro-bench cases at 6-24 rows.
 COMBINE_EARLY_TRIGGER = True
 SOFTMAX_SCALE = HEAD_DIM**-0.5
+# combine_counter: a row's tile CTAs wait for each other, so a launch takes it only when
+# every CTA fits on its own SM; past this deadline a waiting CTA traps instead of hanging
+FUSED_WAIT_DEADLINE_NS = 2_000_000_000
+# per-CTA %globaltimer stamps (bench only): [rows * tiles, STAMP_SLOTS] int64
+STAMP_SLOTS = 16
 
 
 @triton.jit
@@ -70,6 +75,20 @@ def _combine(
     tl.store(OUT + (b * H + h) * 512 + d, out)
 
 
+_SM_COUNT: dict = {}
+
+
+def fused_combine_fits(rows: int, tiles: int, device) -> bool:
+    """Whether a launch of ``rows`` x ``tiles`` CTAs can merge in the kernel: all of
+    them resident at once, one per SM."""
+    index = torch.device(device).index
+    if index is None:
+        index = torch.cuda.current_device()
+    if index not in _SM_COUNT:
+        _SM_COUNT[index] = torch.cuda.get_device_properties(index).multi_processor_count
+    return rows * tiles <= _SM_COUNT[index]
+
+
 def _q_rope_kwargs(q_rope, b):
     freqs, positions = q_rope
     assert (
@@ -95,6 +114,10 @@ def swapab_attention(
     q_rope=None,
     kv_before_wait=False,
     combine_entry_trigger=False,
+    combine_counter=None,
+    stage_before_wait=False,
+    stamps=None,
+    wait_deadline_ns=FUSED_WAIT_DEADLINE_NS,
 ):
     """V4-layout attention on 16 (TP4) or 8 (TP8) heads; `extra_*` is a second slot range appended
     to each request's keys, and the attention sink is folded in exactly once.
@@ -102,7 +125,14 @@ def swapab_attention(
     combine as one-warp programs over 128 columns. `q_rope` = (fp32 [pos, 64] freqs,
     positions [b]) applies the query RoPE as Q loads. `kv_before_wait` gathers the KV
     rows before the PDL wait: the caller guarantees that only Q is still in flight.
-    `combine_entry_trigger` launches the combine's dependent at the combine's entry."""
+    `combine_entry_trigger` launches the combine's dependent at the combine's entry.
+    `stage_before_wait` (with `kv_before_wait`; slot attn_prewait): 1 also loads the
+    query's RoPE row before the wait, 2 also stages the KV tile in shared memory.
+    `combine_counter` (int32 [>= rows], zero, owned by one call site) merges the tiles
+    inside the attention kernel when every CTA fits on its own SM: the narrow combine's
+    arithmetic, no second launch; not in the chain (its row barrier measured slower than
+    the second launch, benchmark/bench_deepseek_v41_attn_half.py). `stamps` (int64
+    [rows * tiles, STAMP_SLOTS]) records per-CTA %globaltimer phases for benchmarks."""
     from .swapab_gluon import partial_gluon  # Gluon imports only where it runs
 
     block = 64
@@ -131,7 +161,29 @@ def swapab_attention(
     maximum = torch.empty((b, nt, h), dtype=torch.float32, device=q.device)
     sums = torch.empty_like(maximum)
     out = torch.empty((b, h, 512), dtype=q.dtype, device=q.device)
-    partial_gluon[(b, nt)](
+    fused = (
+        combine_counter is not None
+        and narrow_combine
+        and fused_combine_fits(b, nt, q.device)
+    )
+    if fused:
+        assert combine_counter.dtype == torch.int32 and combine_counter.numel() >= b
+        st = triton.next_power_of_2(nt)
+        rounds = triton.cdiv(triton.cdiv(h * 4, nt), 4)
+        fused_kwargs = dict(
+            FUSED=True,
+            CNT=combine_counter,
+            SINK=sink,
+            OUT=out,
+            DEADLINE=wait_deadline_ns,
+            ST=st,
+            ROUNDS=rounds,
+        )
+    else:
+        fused_kwargs = {}
+    if stamps is not None:
+        assert stamps.dtype == torch.int64 and stamps.numel() >= b * nt * STAMP_SLOTS
+    partial_gluon[(nt, b) if fused else (b, nt)](
         q,
         kv,
         extra_kv,
@@ -168,8 +220,17 @@ def swapab_attention(
         **({"USE_GDC": True, "launch_pdl": True} if pdl else {}),
         **(_q_rope_kwargs(q_rope, b) if q_rope is not None else {}),
         **({"KV_BEFORE_WAIT": True} if pdl and kv_before_wait else {}),
+        **(
+            {"STAGE_BEFORE_WAIT": int(stage_before_wait)}
+            if pdl and kv_before_wait and stage_before_wait
+            else {}
+        ),
         **({"HQ": h} if h != NUM_HEADS else {}),
+        **fused_kwargs,
+        **({"STAMPS": True, "STAMP": stamps} if stamps is not None else {}),
     )
+    if fused:
+        return out
     bd = 64 if ne else 512
     combine_warps = 4
     if narrow_combine and ne:

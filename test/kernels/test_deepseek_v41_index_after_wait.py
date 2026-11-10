@@ -10,8 +10,14 @@
   do) it reads the new selection on every replay; without it, it reads the old one.
 - The fused consumer with ``trigger_after_write``: a dependent that reads the selection
   before its own wait sees the written selection.
+- The real index chain (benchmark/bench_deepseek_v41_index_chain.py: the plugin indexer
+  on SGLang's kernels, the plugin's query chain, swap-AB, wo_a, wo_b): every consumer
+  layer's attention output is the same with the slot and the fenced trigger as without,
+  over graph replays (a Full layer's stock top-k emits its picks in no fixed order, so
+  its attention varies run to run in every arm).
 """
 
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -273,3 +279,43 @@ def test_the_fused_consumer_writes_before_it_triggers(rows):
         assert (out != -7).any()
         assert torch.equal(seen, out)
 
+
+def _bench():
+    path = HERE.parent.parent / "benchmark" / "bench_deepseek_v41_index_chain.py"
+    spec = importlib.util.spec_from_file_location("bench_index_chain", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@needs_gpu
+@pytest.mark.parametrize("heads", (16, 8))
+@pytest.mark.parametrize("ctx", (8192, 65536))
+def test_the_index_chain_attention_is_unchanged_over_replays(heads, ctx):
+    from sgl_nvidia_mega.deepseek_v41.sm103.attention import reindex_select as rs
+
+    bench = _bench()
+    pattern = "R,S,R,F,R,C,R,C,F,C,R".split(",")
+    step = bench.Step(pattern, heads, 6, ctx, stock_consumer=False)
+    arms = ("old", "base", "stock_safe", "safe")
+    try:
+        graphs = {arm: step.graph(arm) for arm in arms}
+    finally:
+        # the bench binds the fused consumer's trigger per arm
+        rs.reindex_select = getattr(rs, "_bench_orig", rs.reindex_select)
+    # the consumers' (fused, deterministic) selections; a Full layer's stock paged
+    # top-k emits its picks in no fixed order, which moves its attention's tiles
+    index = [i for i, k in enumerate(pattern) if k == "C"]
+    differ = {arm: 0 for arm in arms[1:]}
+    for _ in range(12):
+        got = {}
+        for arm in arms:
+            graphs[arm][0].replay()
+            torch.cuda.synchronize()
+            got[arm] = [graphs[arm][1][i].clone() for i in index]
+        for arm in arms[1:]:
+            differ[arm] += sum(
+                int(not torch.equal(u.view(torch.int16), v.view(torch.int16)))
+                for u, v in zip(got["old"], got[arm])
+            )
+    assert differ == {arm: 0 for arm in arms[1:]}

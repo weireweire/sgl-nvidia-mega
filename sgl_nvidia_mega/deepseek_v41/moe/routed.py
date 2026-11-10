@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The routed experts of a MoE layer on the GEMM pair (``sm103/moe``), reading SGLang's
 loaded MXFP4 experts in place, and the router's top-k on the fast gate kernel
-(``gate_topk.cu``) where it reproduces the router bit for bit."""
+(``gate_topk.cu``) where it reproduces the router bit for bit. Under expert parallelism
+the pair holds the rank's window of experts and drops the slots routed elsewhere, as
+SGLang's FlashInfer routed MoE does (``local_expert_offset``)."""
 
 from __future__ import annotations
 
@@ -47,6 +49,7 @@ SGLANG_READS = {
     ),
     "srt/layers/moe/fused_moe_triton/layer.py": (
         "num_local_experts",
+        "moe_ep_rank",
         "num_experts",
         "top_k",
         "quant_method",
@@ -196,6 +199,12 @@ def gate_applies(mlp: torch.nn.Module) -> bool:
     )
 
 
+def expert_offset(experts: torch.nn.Module) -> int:
+    """The router id of the rank's first local expert, as SGLang's FlashInfer routed
+    MoE takes it (``local_expert_offset``); 0 without expert parallelism."""
+    return experts.moe_ep_rank * experts.num_local_experts
+
+
 def build(
     model: torch.nn.Module, group, *, gate_topk: bool, shared_ll=False, widths=()
 ) -> Bound:
@@ -232,8 +241,6 @@ def build_layers(
             method = experts.quant_method
             if not isinstance(method, Mxfp4FlashinferTrtllmMoEMethod):
                 raise ValueError(f"layer {i}: experts on {type(method).__name__}")
-            if experts.num_local_experts != experts.num_experts:
-                raise ValueError(f"layer {i}: expert parallelism")
             if mlp.alt_stream is None or mlp.num_fused_shared_experts:
                 continue  # SGLang's dual-stream order does not apply
             gemm = RoutedExpertGemm(
@@ -245,6 +252,8 @@ def build_layers(
                 top_k=experts.top_k,
                 max_rows=SERVED_MAX_ROWS,
                 gate_topk=gate_topk,
+                router_experts=experts.num_experts,
+                expert_offset=expert_offset(experts),
             )
             gate = gate_topk and gemm.gate_topk_kernel is not None and gate_applies(mlp)
             slots[i] = MoeSlot(mlp, gemm, gate=gate)

@@ -5,8 +5,8 @@
 """The MoE step of a covered decode step, over SGLang's loaded ``DeepseekV2MoE`` block.
 
 The stock step issues what ``DeepseekV2MoE.forward`` issues for the covered
-configuration (CUDA, TP 4, no expert / attention / context parallelism, no EPLB, no
-fused shared experts), calling the block's own gate, top-k, routed experts and shared
+configuration (CUDA, TP4, or TP8 with MoE TP4 x EP2; no attention / context
+parallelism, no EPLB, no fused shared experts), calling the block's own gate, top-k, routed experts and shared
 expert: at CUDA graph capture the dual-stream order (routed on the main stream, shared
 expert on the alternate stream), otherwise the eager order. Its output is what the
 decoder layer hands the FFN post: the unmerged pieces (``MoEOutput``), or the deferred

@@ -2,10 +2,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Low-batch routed-expert GEMMs for DeepSeek-V4.1 decode.
 
-A TP MoE layer (all experts local, intermediate 576
-padded to 640) replaces FlashInfer's TRT-LLM-gen routing + two batched GEMMs by a route
-kernel and a GEMM pair of 8-row tcgen05 block-scaled tiles (persistent schedule, PDL),
-compiled with NVRTC on first use. An expert chosen by more than 8 rows gets several
+A MoE layer at MoE TP4 (intermediate 576 padded to 640; all experts local, or under
+expert parallelism the rank's consecutive window of them) replaces FlashInfer's
+TRT-LLM-gen routing + two batched GEMMs by a route kernel and a GEMM pair of 8-row
+tcgen05 block-scaled tiles (persistent schedule, PDL), compiled with NVRTC on first use. An expert chosen by more than 8 rows gets several
 consecutive tiles (route_wide.cu). The kernels read the same shuffled MXFP4 weights and
 MXFP8 activations as FlashInfer and return its deferred-finalize triple, so the fused
 finalize + all-reduce + mHC consumer is unchanged. On the target and DSpark draft
@@ -278,7 +278,11 @@ class RoutedExpertGemm:
         top_k: int,
         max_rows: int,
         gate_topk: bool = False,
+        router_experts: Optional[int] = None,
+        expert_offset: int = 0,
     ):
+        """``router_experts``: the router's expert count (default: the local ones);
+        ``expert_offset``: the router id of local expert 0 (expert parallelism)."""
         w13, w13_scale = w13.view(torch.uint8), w13_scale.view(torch.uint8)
         w2, w2_scale = w2.view(torch.uint8), w2_scale.view(torch.uint8)
         check_weights(w13, w13_scale, w2, w2_scale, clamp, top_k)
@@ -287,6 +291,19 @@ class RoutedExpertGemm:
                 f"max_rows {max_rows} is outside {MAX_ROWS}-{WIDE_MAX_ROWS}"
             )
         self.experts = int(w13.size(0))
+        self.router_experts = (
+            self.experts if router_experts is None else int(router_experts)
+        )
+        self.expert_offset = int(expert_offset)
+        if not (
+            0 <= self.expert_offset
+            and self.expert_offset + self.experts <= self.router_experts
+        ):
+            raise ValueError(
+                f"local experts [{self.expert_offset}, "
+                f"{self.expert_offset + self.experts}) are outside the router's "
+                f"{self.router_experts}"
+            )
         self.top_k = top_k
         self.max_rows = max_rows
         self.kernels = load_kernels(w13.device.index)
@@ -294,9 +311,9 @@ class RoutedExpertGemm:
             load_route_wide(w13.device.index) if max_rows > MAX_ROWS else None
         )
         # the router's (experts, top_k) picks the variant: target or DSpark draft
-        fits_gate_topk = (self.experts, top_k) in GATE_TOPK_VARIANTS
+        fits_gate_topk = (self.router_experts, top_k) in GATE_TOPK_VARIANTS
         self.gate_topk_kernel = (
-            load_gate_topk(w13.device.index, self.experts, top_k)
+            load_gate_topk(w13.device.index, self.router_experts, top_k)
             if gate_topk and fits_gate_topk
             else None
         )
@@ -353,6 +370,7 @@ class RoutedExpertGemm:
                     ctypes.c_int32(rows),
                     ctypes.c_int32(top_k),
                     ctypes.c_int32(self.experts),
+                    ctypes.c_int32(self.expert_offset),
                 ],
                 stream,
             )
@@ -368,6 +386,7 @@ class RoutedExpertGemm:
                     ctypes.c_int32(rows),
                     ctypes.c_int32(top_k),
                     ctypes.c_int32(self.experts),
+                    ctypes.c_int32(self.expert_offset),
                 ],
                 stream,
             )
@@ -429,6 +448,7 @@ class RoutedExpertGemm:
         that id rank with bias_alt (DSV4.1 VL routing). ``num_valid`` None means every row is valid. The
         caller joins the quantized input before this call: a stream join between the route
         kernel and GEMM1 would cost GEMM1 its PDL early launch.
+        The ids are the router's; a slot whose expert another rank holds maps to row -1.
         Returns (gemm2 rows, top-k weights, slot -> row, top-k ids)."""
         rows = logits.size(0)
         device = logits.device
@@ -470,6 +490,7 @@ class RoutedExpertGemm:
             ctypes.c_int32(rows),
             ctypes.c_int32(self.top_k),
             ctypes.c_int32(self.experts),
+            ctypes.c_int32(self.expert_offset),
         ]
         if rows > MAX_ROWS:
             _launch(self.route_wide, (1, 1, 1), common + sizes, stream)
@@ -501,7 +522,7 @@ class RoutedExpertGemm:
             and logits.dtype == torch.float32
             and logits.dim() == 2
             and logits.is_contiguous()
-            and tuple(logits.shape[1:]) == (self.experts,)
+            and tuple(logits.shape[1:]) == (self.router_experts,)
             and 1 <= logits.size(0) <= self.max_rows
             and bias.dtype == torch.float32
             and bias.is_contiguous()

@@ -64,8 +64,10 @@ def why_not(mlp: torch.nn.Module) -> str:
     ):
         return "gate_up has no MXFP8 view"
     n, k = gate_up.weight.shape
-    if n % 128 or k % 128:
-        return f"gate_up {n} x {k}: the kernel takes multiples of 128"
+    # N: the TP8 shard's 576 (2 x 288) ends in half a 128-row tile, which the kernel's
+    # TMA zero-fills and its predicated stores drop; its swizzled scales are padded
+    if n % 64 or k % 128:
+        return f"gate_up {n} x {k}: the kernel takes N % 64 == 0 and K % 128 == 0"
     return ""
 
 

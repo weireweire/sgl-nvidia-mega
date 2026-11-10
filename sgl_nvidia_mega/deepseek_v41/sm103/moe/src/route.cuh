@@ -10,12 +10,12 @@
 // batched GEMMs read. The result is that of FlashInfer's TRT-LLM-gen routing
 // kernel with precomputed ids and an 8-token tile:
 //
-//   * local experts (ids in [0, experts)) in ascending id order, each one's
-//   rows in
-//     ascending token order, every expert's segment padded to a multiple of the
-//     tile (8 rows);
-//   * permuted[t, k] = the slot's row in that order, -1 for an id outside
-//     [0, experts);
+//   * local experts (ids in [offset, offset + experts), with expert_offset the
+//     first id this rank holds under expert parallelism, 0 otherwise) in
+//     ascending id order, each one's rows in ascending token order, every
+//     expert's segment padded to a multiple of the tile (8 rows);
+//   * permuted[t, k] = the slot's row in that order, -1 for an id this rank
+//     does not hold;
 //   * route (int32, one buffer per call):
 //       [0]                       8 * CTAs (padded rows)
 //       [1]                       CTAs
@@ -87,7 +87,8 @@ __device__ __forceinline__ void Build(Scratch &scratch, const int *ids,
                                       int *__restrict__ permuted,
                                       int *__restrict__ record,
                                       unsigned int *barrier, int rows,
-                                      int top_k, int experts, int thread) {
+                                      int top_k, int experts, int expert_offset,
+                                      int thread) {
   const int slots = rows * top_k;
   const int max_ctas = MaxCtas(rows, top_k, experts);
   const int cta_words = CtaWords(max_ctas);
@@ -98,7 +99,7 @@ __device__ __forceinline__ void Build(Scratch &scratch, const int *ids,
   const int row = thread / top_k;
   int expert = -1;
   if (thread < slots) {
-    expert = ids[thread];
+    expert = ids[thread] - expert_offset;
     if (expert < 0 || expert >= experts)
       expert = -1;
   }

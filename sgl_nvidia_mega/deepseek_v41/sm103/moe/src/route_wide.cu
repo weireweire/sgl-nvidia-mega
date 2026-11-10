@@ -26,11 +26,12 @@ __device__ __forceinline__ int MaxCtas(int rows, int top_k, int experts) {
 }
 } // namespace
 
-// experts <= 384; rows <= 64; rows * top_k <= 512. barrier: unused.
+// experts (local) <= 384; rows <= 64; rows * top_k <= 512. expert_offset: the
+// global id of local expert 0, as in route.cuh. barrier: unused.
 extern "C" __global__
 __launch_bounds__(kThreads) void dsv41_routed_expert_route_wide(
     const int *ids, int *__restrict__ permuted, int *__restrict__ record,
-    int rows, int top_k, int experts) {
+    int rows, int top_k, int experts, int expert_offset) {
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   __shared__ unsigned long long rows_of[kMaxExperts];
   __shared__ int first_cta[kMaxExperts];
@@ -55,7 +56,7 @@ __launch_bounds__(kThreads) void dsv41_routed_expert_route_wide(
   const int row = thread / top_k;
   int expert = -1;
   if (thread < slots) {
-    expert = ids[thread];
+    expert = ids[thread] - expert_offset;
     if (expert < 0 || expert >= experts)
       expert = -1;
   }

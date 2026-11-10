@@ -18,11 +18,13 @@ namespace {
 constexpr int kThreads = 64; // >= rows * top_k (at most 8 * 8 slots)
 } // namespace
 
-// experts: a multiple of 32, at most 384; rows <= 8; rows * top_k <= 64.
+// experts (local): a multiple of 32, at most 384; rows <= 8; rows * top_k <=
+// 64. expert_offset: the global id of local expert 0.
 extern "C" __global__
 __launch_bounds__(kThreads) void dsv41_routed_expert_route(
     const int *ids, int *__restrict__ permuted, int *__restrict__ record,
-    unsigned int *barrier, int rows, int top_k, int experts) {
+    unsigned int *barrier, int rows, int top_k, int experts,
+    int expert_offset) {
   asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   __shared__ route::Scratch scratch;
   const int thread = static_cast<int>(threadIdx.x);
@@ -31,5 +33,5 @@ __launch_bounds__(kThreads) void dsv41_routed_expert_route(
   asm volatile("griddepcontrol.wait;" ::: "memory");
   route::Zero(record, rows, top_k, experts, thread, kThreads);
   route::Build(scratch, ids, permuted, record, barrier, rows, top_k, experts,
-               thread);
+               expert_offset, thread);
 }

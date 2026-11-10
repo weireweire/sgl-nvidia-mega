@@ -9,7 +9,10 @@ head and logits (``logits``, SGLang's logits processor). Stock: the tail of
 Slot target_lm_head (``build``): the logits processor gets a stand-in for the LM head
 whose quant method runs the shard on FlashInfer's low-M BF16 kernel at
 1-TARGET_MAX_ROWS rows (batch 1) and SGLang's own matmul otherwise; the TP gather, the logit
-scale and the output fields stay SGLang's."""
+scale and the output fields stay SGLang's. With slot target_lm_head_mxfp8 the 1-8 rows
+stream an MXFP8 copy of the shard instead (sm103/lm_head_mxfp8.py; the verifier's logits
+at lower precision, a numerics change), shared with the draft's head; more rows keep
+SGLang's matmul on the BF16 weight."""
 
 from __future__ import annotations
 
@@ -60,13 +63,15 @@ class LowMLmHeadMethod:
     any method outside its unquantized names, ahead of its FP32 and on-policy branches
     (so ``build`` refuses those)."""
 
-    def __init__(self, weight: torch.Tensor, *, pinned: bool = False):
+    def __init__(self, weight: torch.Tensor, *, pinned: bool = False, mxfp8=None):
         self.weight = weight
         # the CuTe DSL kernels take operands over DLPack, which refuses grad tensors
         self.weight_t = weight.detach().t()
         self.captured_rows: set[int] = set()
         # slot lm_head_pinned_tactic: one fixed tactic per row count, no tuning
         self.pinned = pinned
+        # slot target_lm_head_mxfp8: the shard's MXFP8 copy (lm_head_mxfp8.Mxfp8Weight)
+        self.mxfp8 = mxfp8
 
     def low_m(self, x: torch.Tensor, bias) -> bool:
         return (
@@ -86,6 +91,10 @@ class LowMLmHeadMethod:
             # a replay runs no Python: the captured row counts are where it serves
             self.captured_rows.add(rows)
             logger.info("NVIDIA megakernel: target_lm_head captured at %d rows", rows)
+        if self.mxfp8 is not None:
+            from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
+
+            return lm_head_mxfp8.matmul(x, self.mxfp8)
         if self.pinned:
             from sgl_nvidia_mega.deepseek_v41.sampler.pinned import pinned_mm
 
@@ -97,6 +106,11 @@ class LowMLmHeadMethod:
     def tune(self) -> None:
         """The same calls on every rank, before any graph is captured; the draft's head
         shares the weight, so this and the draft's tuning share FlashInfer's cache."""
+        if self.mxfp8 is not None:
+            from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
+
+            lm_head_mxfp8.precompile(*self.mxfp8.shape, self.weight.device)
+            return
         if self.pinned:
             return
         from flashinfer.autotuner import autotune
@@ -112,9 +126,9 @@ class TargetLmHead:
     """What the logits processor gets for the LM head: SGLang's module, with the
     low-M quant method."""
 
-    def __init__(self, lm_head, *, pinned: bool = False):
+    def __init__(self, lm_head, *, pinned: bool = False, mxfp8=None):
         self.lm_head, self.weight = lm_head, lm_head.weight
-        self.quant_method = LowMLmHeadMethod(lm_head.weight, pinned=pinned)
+        self.quant_method = LowMLmHeadMethod(lm_head.weight, pinned=pinned, mxfp8=mxfp8)
 
     def __getattr__(self, name):
         return getattr(self.lm_head, name)
@@ -124,8 +138,22 @@ def _capturing() -> bool:
     return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
 
-def target_lm_head_reason(lm) -> str:
-    """Why slot target_lm_head cannot serve this model's head ("" when it can)."""
+def mxfp8_copy(weight):
+    """The shard's MXFP8 copy, one per weight (the draft's head shares it)."""
+    from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
+
+    copy = lm_head_mxfp8.shared(weight)
+    logger.info(
+        "NVIDIA megakernel: LM head MXFP8 copy %s: %.1f MiB",
+        tuple(copy.shape),
+        lm_head_mxfp8.nbytes(copy) / 2**20,
+    )
+    return copy
+
+
+def target_lm_head_reason(lm, *, mxfp8: bool = False) -> str:
+    """Why slot target_lm_head (with target_lm_head_mxfp8: on the MXFP8 stream) cannot
+    serve this model's head ("" when it can)."""
     from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 
     head, proc = lm.lm_head, lm.logits_processor
@@ -140,6 +168,10 @@ def target_lm_head_reason(lm) -> str:
         return "SGLang computes the LM head in FP32"
     if proc.rl_on_policy_target is not None:
         return "SGLang's on-policy target branch"
+    if mxfp8:
+        from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
+
+        return lm_head_mxfp8.unsupported_reason(weight)
     if not low_m_lm_head_supported():
         return f"FlashInfer's {LM_HEAD_BACKEND} BF16 GEMM is unavailable"
     return ""
@@ -151,11 +183,25 @@ def build(model, ctx, group):
 
     if "target_lm_head" not in SLOTS:
         return None
-    reason = target_lm_head_reason(model)
+    mxfp8 = "target_lm_head_mxfp8" in SLOTS
+    reason = target_lm_head_reason(model, mxfp8=mxfp8)
     if reason:
         logger.warning("NVIDIA megakernel: target LM head not built: %s", reason)
         return None
-    head = TargetLmHead(model.lm_head, pinned="lm_head_pinned_tactic" in SLOTS)
+    copy = mxfp8_copy(model.lm_head.weight) if mxfp8 else None
+    if copy is not None:
+        from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
+
+        reason = lm_head_mxfp8.scale_reason(copy)
+        if not _all_ranks_true(group, not reason):
+            logger.warning(
+                "NVIDIA megakernel: target LM head not built: %s",
+                reason or "another rank's MXFP8 copy is out of range",
+            )
+            return None
+    head = TargetLmHead(
+        model.lm_head, pinned="lm_head_pinned_tactic" in SLOTS, mxfp8=copy
+    )
     head.quant_method.tune()
     error = check_against_sglang(model, head)
     if not _all_ranks_true(group, not error):
@@ -173,7 +219,9 @@ def check_against_sglang(model, head) -> str:
     within spec.NUMERICS); the logit scale, TP gather and buffers follow either."""
     from sgl_nvidia_mega.deepseek_v41.spec import NUMERICS
 
-    tol = NUMERICS.tolerances["target_lm_head.logits.rel"]
+    mxfp8 = head.quant_method.mxfp8 is not None
+    key = "target_lm_head_mxfp8" if mxfp8 else "target_lm_head"
+    tol = NUMERICS.tolerances[f"{key}.logits.rel"]
     proc, w = model.logits_processor, head.weight
     gen = torch.Generator(device=w.device).manual_seed(0)
     for rows in CHECK_ROWS:

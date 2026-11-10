@@ -129,22 +129,40 @@ def low_m_lm_head_supported() -> bool:
 
 class DraftLmHead:
     """This rank's LM-head shard for the draft's rows: FlashInfer's low-M BF16 kernel
-    at 1-LM_HEAD_MAX_ROWS rows, SGLang's projection otherwise."""
+    at 1-LM_HEAD_MAX_ROWS rows, SGLang's projection otherwise. With slot
+    draft_lm_head_mxfp8 (measurement only, plan.MEASUREMENT_ONLY_SLOTS) the 1-8 rows
+    stream the shard's MXFP8 copy, the one the target's head reads."""
 
-    def __init__(self, lm_head, *, low_m: bool, pinned: bool = False):
+    def __init__(self, lm_head, *, low_m: bool, pinned: bool = False, mxfp8=None):
         self.lm_head = lm_head
         # the CuTe DSL kernels take operands over DLPack, which refuses grad tensors
         self.weight_t = lm_head.weight.detach().t()
         self.low_m = low_m and lm_head.weight.dtype == torch.bfloat16
         # slot lm_head_pinned_tactic: one fixed tactic per row count, no tuning
         self.pinned = pinned
+        # slot draft_lm_head_mxfp8: lm_head_mxfp8.Mxfp8Weight of this shard
+        self.mxfp8 = mxfp8 if self.low_m else None
 
     def takes(self, rows: int) -> bool:
         return self.low_m and rows <= LM_HEAD_MAX_ROWS
 
+    def streams(self, rows: int) -> bool:
+        from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
+
+        return self.mxfp8 is not None and rows <= lm_head_mxfp8.MAX_ROWS
+
+    def kind(self, rows: int) -> str:
+        if self.streams(rows):
+            return "MXFP8 stream"
+        return "low-M" if self.takes(rows) else "SGLang's"
+
     def tune(self, rows: tuple[int, ...]) -> None:
-        """Tune the low-M kernel at the row counts the draft runs; the same calls on
-        every rank, before any graph is captured."""
+        """Tune the low-M kernel at the row counts the draft runs (compile the MXFP8
+        stream's); the same calls on every rank, before any graph is captured."""
+        if self.mxfp8 is not None:
+            from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
+
+            lm_head_mxfp8.precompile(*self.mxfp8.shape, self.lm_head.weight.device)
         if self.pinned:
             return
         from flashinfer.autotuner import autotune
@@ -152,7 +170,7 @@ class DraftLmHead:
         weight = self.lm_head.weight
         with autotune(True):
             for r in rows:
-                if self.takes(r):
+                if self.takes(r) and not self.streams(r):
                     self(
                         torch.zeros(
                             r, weight.shape[1], dtype=weight.dtype, device=weight.device
@@ -160,6 +178,10 @@ class DraftLmHead:
                     )
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if self.streams(x.shape[0]):
+            from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
+
+            return lm_head_mxfp8.matmul(x.contiguous(), self.mxfp8)
         if not self.takes(x.shape[0]):
             from sglang.srt.models.dspark import project_through_lm_head
 
@@ -234,8 +256,14 @@ def build_steps(
         lm.lm_head,
         low_m=low_m and low_m_lm_head_supported(),
         pinned="lm_head_pinned_tactic" in SLOTS,
+        mxfp8=draft_mxfp8_copy(lm.lm_head.weight, SLOTS),
     )
-    mismatch = mismatch_message(_gather(cpu_group, (chain.max_rows, lm_head.low_m)))
+    mismatch = mismatch_message(
+        _gather(
+            cpu_group,
+            (chain.max_rows, lm_head.low_m, lm_head.mxfp8 is not None),
+        )
+    )
     if mismatch:
         raise RuntimeError(mismatch)
     lm_head.tune(tuple(bs * gamma for bs in range(1, chain.max_rows + 1)))
@@ -256,7 +284,7 @@ def build_steps(
     }
     logger.info(
         "NVIDIA megakernel: draft proposal on rank %d: Markov chain in one kernel "
-        "(%d ranks, batch 1-%d, %d draft tokens), LM head %s at 1-%d rows; wait "
+        "(%d ranks, batch 1-%d, %d draft tokens), LM head %s at 1-%d rows%s; wait "
         "deadline %.0f s; %.1f MiB of device memory",
         rank,
         world,
@@ -264,10 +292,34 @@ def build_steps(
         gamma,
         "low-M" if lm_head.low_m else "SGLang's",
         LM_HEAD_MAX_ROWS,
+        " (MXFP8 stream at 1-8)" if lm_head.mxfp8 is not None else "",
         chain.timeout_ns / 1e9,
         (free_before - torch.cuda.mem_get_info()[0]) / 2**20,
     )
     return steps
+
+
+def draft_mxfp8_copy(weight: torch.Tensor, slots):
+    """Slot draft_lm_head_mxfp8's MXFP8 copy of the shard (the target head's, when that
+    head streams too), or None; build_steps refuses ranks that disagree."""
+    if "draft_lm_head_mxfp8" not in slots:
+        return None
+    from sgl_nvidia_mega.deepseek_v41.logits import mxfp8_copy
+    from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
+
+    reason = lm_head_mxfp8.unsupported_reason(weight)
+    copy = None if reason else mxfp8_copy(weight)
+    reason = reason or lm_head_mxfp8.scale_reason(copy)
+    if reason:
+        logger.warning(
+            "NVIDIA megakernel: slot draft_lm_head_mxfp8 not built: %s", reason
+        )
+        return None
+    logger.warning(
+        "NVIDIA megakernel: slot draft_lm_head_mxfp8 is on: the draft's LM head reads "
+        "an MXFP8 copy below the checkpoint's BF16; for measurement only"
+    )
+    return copy
 
 
 class _Step:
@@ -307,7 +359,7 @@ class _Step:
                 "rows (%s)",
                 self.bs,
                 hidden_states.shape[0],
-                "low-M" if self.lm_head.takes(hidden_states.shape[0]) else "SGLang's",
+                self.lm_head.kind(hidden_states.shape[0]),
             )
             self.is_logged = True
         if not self.greedy_draft:
@@ -441,13 +493,15 @@ def refusal_message(reasons: list[str]) -> str:
     return "NVIDIA megakernel: the markov slot cannot run: " + "; ".join(found)
 
 
-def mismatch_message(built: list[tuple[int, bool]]) -> str:
-    """ "" when every rank built the same (batch sizes, low-M LM head), else the split."""
+def mismatch_message(built: list[tuple]) -> str:
+    """ "" when every rank built the same (batch sizes, low-M LM head, MXFP8 stream),
+    else the split."""
     if len(set(built)) <= 1:
         return ""
     return "NVIDIA megakernel: the ranks built different draft proposals: " + "; ".join(
         f"rank {rank}: batch 1-{rows}, low-M LM head {low_m}"
-        for rank, (rows, low_m) in enumerate(built)
+        + (f", MXFP8 stream {mxfp8[0]}" if mxfp8 else "")
+        for rank, (rows, low_m, *mxfp8) in enumerate(built)
     )
 
 

@@ -262,6 +262,9 @@ NUMERICS = Numerics(
         # slot target_lm_head: the target's logits shard on the low-M kernel against
         # SGLang's matmul, checked at build on every rank (the K summation order differs)
         "target_lm_head.logits.rel": 2**-7,
+        # slot target_lm_head_mxfp8: the same check on the MXFP8 stream, whose weight is
+        # the shard quantized (test_deepseek_v41_lm_head_mxfp8.py)
+        "target_lm_head_mxfp8.logits.rel": 4e-2,
     },
 )
 

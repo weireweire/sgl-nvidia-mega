@@ -51,6 +51,9 @@ NUMERICS = Numerics(
         "draft_markov.step_logits.rel": 2**-7,
         # the draft's base logits on the low-M kernel: the K summation order differs
         "draft_lm_head.logits.rel": 2**-7,
+        # slot draft_lm_head_mxfp8 (measurement only): the MXFP8 stream against the BF16
+        # head; the weight's quantization (test_deepseek_v41_lm_head_mxfp8.py)
+        "draft_lm_head_mxfp8.logits.rel": 4e-2,
     },
 )
 
@@ -68,6 +71,7 @@ class DraftProposal:
     def __init__(self, lm, *, deadline_s: float, slots: frozenset[str]):
         self.lm, self.deadline_s = lm, deadline_s
         self.low_m = "draft_lm_head" in slots
+        self.mxfp8 = self.low_m and "draft_lm_head_mxfp8" in slots
         # SGLang's proposal runs when the markov slot is off
         self.draft_sampler: Optional[Callable] = (
             self._draft_sampler if "markov" in slots else None
@@ -88,6 +92,8 @@ class DraftProposal:
         if self.draft_sampler is None:
             return "DSpark draft: SGLang's proposal (markov slot off)"
         lm_head = "low-M" if self.low_m else "SGLang's"
+        if self.mxfp8:
+            lm_head += " (MXFP8 stream at 1-8 rows, measurement only)"
         return f"DSpark draft proposal: Markov chain in one kernel, LM head {lm_head}"
 
     def plan(self, input_ids, forward_batch, *args, **kwargs):

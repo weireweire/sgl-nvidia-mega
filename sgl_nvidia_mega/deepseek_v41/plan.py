@@ -30,6 +30,12 @@ FAST_GATE_WIDE_ROWS = frozenset(range(1, ROUTED_MAX_ROWS + 1))
 # the Engram prefetch serves batch 1 only (6 rows): at batch 2 (12 rows) the A/B measured
 # +78 us, the quarters' HBM reads overlapping a MoE that is no longer latency-bound
 ENGRAM_PREFETCH_MAX_ROWS = 8
+# Slots that lower numerics below what the checkpoint ships, for measurement only:
+# draft_lm_head_mxfp8 runs the DSpark draft's LM head on an MXFP8 copy, while the released
+# DeepSeek-V4.1-Flash ships that head in BF16 (one `head.weight`, shared by the target and
+# the draft); InferenceX's review rules forbid a draft head below the checkpoint's
+# precision. target_lm_head_mxfp8 (the verifier's head) is not here: it is gated on evals.
+MEASUREMENT_ONLY_SLOTS = frozenset({"draft_lm_head_mxfp8"})
 
 
 class Slots(msgspec.Struct, frozen=True):

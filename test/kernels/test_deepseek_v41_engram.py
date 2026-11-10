@@ -7,7 +7,7 @@ noted), against SGLang's.
   against SGLang's TP4 lookup (each rank's fused shard lookup, then the all-reduce's
   sum) at every routed row count, int32 and int64 token ids. The values are equal; only
   a -0.0 entry reads +0.0 after the all-reduce.
-- The Engram prefetch's WKV (GB300): each TP4 rank's quarter of the output columns
+- The Engram prefetch's WKV (GB300): each TP4 (TP8) rank's quarter (eighth) of the output columns
   (views of the weight and of its 128-row swizzled scale tiles), zero-padded and summed
   as the main-stream gather sums them, equals SGLang's whole WKV GEMM at representative
   row counts the prefetch serves. The serving build repeats the check on the loaded
@@ -104,7 +104,7 @@ def test_the_whole_table_lookup_equals_the_sharded_one(table, dtype, monkeypatch
 
 # ---------------------------------------------------------------------- Engram prefetch
 
-TP, N, K, HASH_COLS = 4, 25600, 6144, 12  # DeepSeek-V4.1-Flash's WKV
+N, K, HASH_COLS = 25600, 6144, 12  # DeepSeek-V4.1-Flash's WKV
 
 
 def _engram_ready() -> bool:
@@ -138,8 +138,9 @@ def wkv():
 
 
 @needs_engram
+@pytest.mark.parametrize("tp", [4, 8], ids=["tp4", "tp8"])
 @pytest.mark.parametrize("rows", [1, 6, 16])
-def test_the_column_quarters_sum_to_sglangs_wkv(wkv, rows):
+def test_the_column_quarters_sum_to_sglangs_wkv(wkv, rows, tp):
     from sglang.srt.layers.quantization.fp8_utils import (
         flashinfer_mxfp8_blockscaled_linear,
     )
@@ -156,15 +157,15 @@ def test_the_column_quarters_sum_to_sglangs_wkv(wkv, rows):
     )
     engram = SimpleNamespace(wkv=wkv)
     total = torch.zeros((rows, N), dtype=torch.float32, device="cuda")
-    for rank in range(TP):
-        layer = ep._Layer(engram, rank, TP)
+    for rank in range(tp):
+        layer = ep._Layer(engram, rank, tp)
         assert (
-            layer.weight.data_ptr() == wkv.weight[rank * N // TP].data_ptr()
+            layer.weight.data_ptr() == wkv.weight[rank * N // tp].data_ptr()
         )  # a view
         # the side stream's zero-padded quarter, as gather sums it
         padded = torch.zeros((rows, N), dtype=torch.bfloat16, device="cuda")
         padded[:, layer.cols] = layer.quarter(emb)
-        assert layer.cols == slice(rank * N // TP, (rank + 1) * N // TP)
+        assert layer.cols == slice(rank * N // tp, (rank + 1) * N // tp)
         total += padded.float()
     torch.cuda.synchronize()
     assert torch.equal(total.bfloat16(), want)

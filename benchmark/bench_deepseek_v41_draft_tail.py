@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Microbenchmark: the draft proposal's tail at one request, the low-M LM head on this
-rank's shard followed by the sharded Markov chain, with slot markov_pdl off and on.
+"""Microbenchmark: the draft proposal's tail at --rows requests (default one), the low-M LM
+head on this rank's shard followed by the sharded Markov chain, with --slot (markov_pdl
+or markov_lowlat) off and on.
 
 One process per GPU (vocab 129,280, hidden 5,120, 5 draft positions, FP32 step logits).
 Each arm is a CUDA graph of --inner tails (LM head -> chain) after an L2-flushing write
@@ -9,6 +10,9 @@ Each arm is a CUDA graph of --inner tails (LM head -> chain) after an L2-flushin
 prints the median per tail of each arm and of their paired difference.
 
   python benchmark/bench_deepseek_v41_draft_tail.py --world 4 --temps sampled
+
+Under torchrun (RANK / WORLD_SIZE set, e.g. world 8 over two GB300 trays) every process
+is one rank and --world is ignored.
 """
 
 import argparse
@@ -32,9 +36,13 @@ KEY = 0x1234_5678_9ABC_DEF
 
 def _worker(rank: int, args) -> None:
     world = args.world
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(args.port)
-    device = torch.device("cuda", rank)
+    local_rank = rank
+    if args.torchrun:
+        local_rank = int(os.environ["LOCAL_RANK"])
+    else:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = str(args.port)
+    device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     group = None
     if world > 1:
@@ -46,10 +54,11 @@ def _worker(rank: int, args) -> None:
     local = VOCAB // world
     weight = (torch.randn(local, HIDDEN, generator=g, device=device) * 0.02).bfloat16()
     lm_head = sampler.DraftLmHead(SimpleNamespace(weight=weight), low_m=True)
-    lm_head.tune((STEPS,))
+    rows = args.rows
+    lm_head.tune((rows * STEPS,))
     sampled = args.temps == "sampled"
     chains = {
-        pdl: ShardedMarkov(
+        on: ShardedMarkov(
             embed_weight=embed,
             head_weight=head,
             vocab_size=VOCAB,
@@ -58,19 +67,20 @@ def _worker(rank: int, args) -> None:
             group=group,
             rank=rank,
             world=world,
-            max_bs=4,
+            max_bs=max(4, rows),
             deadline_s=20.0,
             keeps_logits=sampled,
-            pdl=pdl,
+            pdl=on and args.slot == "markov_pdl",
+            lowlat=on and args.slot == "markov_lowlat",
         )
-        for pdl in (False, True)
+        for on in (False, True)
     }
-    x = torch.randn(STEPS, HIDDEN, generator=g, device=device).bfloat16()
-    temperatures = torch.full((4,), 1.0 if sampled else 0.0, device=device)
+    x = torch.randn(rows * STEPS, HIDDEN, generator=g, device=device).bfloat16()
+    temperatures = torch.full((max(4, rows),), 1.0 if sampled else 0.0, device=device)
     offset = torch.tensor([7], dtype=torch.int64, device=device)
-    cache = torch.zeros(4, STEPS, VOCAB, device=device) if sampled else None
-    anchor = torch.zeros(1, dtype=torch.int64, device=device)
-    tokens = torch.zeros(1, STEPS, dtype=torch.int64, device=device)
+    cache = torch.zeros(max(4, rows), STEPS, VOCAB, device=device) if sampled else None
+    anchor = torch.zeros(rows, dtype=torch.int64, device=device)
+    tokens = torch.zeros(rows, STEPS, dtype=torch.int64, device=device)
     flush = torch.empty(
         2 * torch.cuda.get_device_properties(device).L2_cache_size,
         dtype=torch.uint8,
@@ -79,10 +89,10 @@ def _worker(rank: int, args) -> None:
 
     def tail(chain):
         if sampled:
-            chain.fork_noise(rows=1, key=KEY, offset=offset)
+            chain.fork_noise(rows=rows, key=KEY, offset=offset)
         if chain.pdl:
             chain.stage_anchor(anchor)
-        base = lm_head(x).view(1, STEPS, -1)
+        base = lm_head(x).view(rows, STEPS, -1)
         if sampled:
             chain.join_noise()
         chain.sample(
@@ -131,7 +141,8 @@ def _worker(rank: int, args) -> None:
         on = [t - f for t, f in zip(times[True], times[None])]
         diff = sorted(b - a for a, b in zip(off, on))
         print(
-            f"world={world} temps={args.temps} inner={args.inner} replays={len(off)}: "
+            f"world={world} rows={rows} slot={args.slot} temps={args.temps} "
+            f"inner={args.inner} replays={len(off)}: "
             f"off {statistics.median(off):.2f} us, on {statistics.median(on):.2f} us, "
             f"paired on-off median {statistics.median(diff):.2f} "
             f"(p10 {diff[len(diff) // 10]:.2f}, p90 {diff[(9 * len(diff)) // 10]:.2f})",
@@ -149,7 +160,16 @@ def main() -> None:
     parser.add_argument("--inner", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--replays", type=int, default=100)
+    parser.add_argument("--rows", type=int, default=1)
+    parser.add_argument(
+        "--slot", choices=("markov_pdl", "markov_lowlat"), default="markov_pdl"
+    )
     args = parser.parse_args()
+    args.torchrun = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    if args.torchrun:
+        args.world = int(os.environ["WORLD_SIZE"])
+        _worker(int(os.environ["RANK"]), args)
+        return
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         args.port = s.getsockname()[1]

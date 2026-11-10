@@ -102,7 +102,9 @@ DRAFT_SLOTS = frozenset(
 # swapab_h8 / wo_a_g1: at attention TP8, swap-AB on the 8 local heads and the fused wo_a
 # on the 1 local group, target and draft, in place of SGLang's FlashMLA and einsum, which
 # TP8 runs (each bitwise to its TP4 kernel on the same heads / group, not to SGLang's
-# TP8 arm); no effect at TP4)
+# TP8 arm); no effect at TP4); attn_index_after_wait: on the indexer layers, swap-AB
+# reads a stock top-k's selection only after its PDL wait (a captured stream join is a
+# programmatic edge and the stock top-k triggers before it writes; bitwise)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -113,6 +115,7 @@ OPT_IN_SLOTS = (
     "attn_indexer_fused",
     "swapab_h8",
     "wo_a_g1",
+    "attn_index_after_wait",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -188,6 +191,7 @@ def slot_reasons() -> list[str]:
         ("draft_wo_b_ll", "draft_wo_a"),
         ("swapab_h8", "attn"),
         ("wo_a_g1", "attn"),
+        ("attn_index_after_wait", "kv_before_wait"),
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
@@ -386,6 +390,9 @@ def build(model, ctx):
             and a.chain[0].indexer is not None
             and a.chain[0].indexer.fused
             for a in bound["attention"].values()
+        ),
+        "attn_index_after_wait": any(
+            a.index_after_wait and a.swapab for a in bound["attention"].values()
         ),
         # the indexer wq_b on the chain's q_lora quant: indexer layers, 1-8 rows
         "index_q_mxfp8_in": any(w <= 8 for w in pctx.widths)

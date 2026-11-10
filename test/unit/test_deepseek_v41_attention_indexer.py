@@ -53,6 +53,7 @@ def _plugin():
     p._served_rows, p._declined, p.compared, p.differ = set(), {}, 0, 0
     p._meta, p._serves, p._table = None, False, None
     p.fused, p._fused_logged, p._fused_now = False, set(), False
+    p._fused_layer = None
     return p
 
 
@@ -558,3 +559,87 @@ def test_the_fused_slot_needs_attn_indexer(monkeypatch):
     )
     assert runtime.slot_reasons() == []
     assert "attn_indexer_fused" not in runtime.SHIPPED_SLOTS
+
+
+@pytest.mark.parametrize("fused, rows, want", [(True, 6, True), (True, 12, False), (False, 6, False)])
+def test_the_fused_consumer_marks_the_selection_it_wrote(fused, rows, want):
+    """Slot attn_index_after_wait reads a selection before the attention's wait only
+    where the fused consumer wrote it (it fences the selection before its trigger)."""
+    p = _plugin()
+    p.topk_blocks, p.fused = 2048, fused
+    _consumer_call(p, rows, [])
+    assert p.wrote_fused(9) is want
+    assert not p.wrote_fused(7)
+    # a new forward forgets it
+    p.serves(_view(_paged()), rows, _fb())
+    assert not p.wrote_fused(9)
+
+
+def test_the_after_wait_slot_is_opt_in_and_needs_kv_before_wait(monkeypatch):
+    from sgl_nvidia_mega.deepseek_v41 import runtime
+
+    assert "attn_index_after_wait" in runtime.OPT_IN_SLOTS
+    assert "attn_index_after_wait" not in runtime.SHIPPED_SLOTS
+    monkeypatch.setattr(
+        runtime, "SLOTS", frozenset({"attn", "attn_index_after_wait"})
+    )
+    assert any("needs slot 'kv_before_wait'" in r for r in runtime.slot_reasons())
+    monkeypatch.setattr(
+        runtime,
+        "SLOTS",
+        frozenset({"attn", "kv_before_wait", "attn_index_after_wait"}),
+    )
+    assert runtime.slot_reasons() == []
+
+
+@pytest.mark.parametrize(
+    "slot, has_indexer, fused_wrote, want",
+    [
+        (True, True, False, True),  # a stock selection: after the wait
+        (True, True, True, False),  # the fused consumer's: before it, as shipped
+        (True, False, False, False),  # a reuse layer
+        (False, True, False, False),  # slot off
+    ],
+)
+def test_swapab_reads_a_stock_selection_after_its_wait(
+    slot, has_indexer, fused_wrote, want
+):
+    import importlib
+
+    step_mod = importlib.import_module("sgl_nvidia_mega.deepseek_v41.attention.step")
+
+    attn = SimpleNamespace(
+        layer_id=3,
+        compress_ratio=1,
+        indexer=object() if has_indexer else None,
+        alt_streams=None,
+    )
+    st = step_mod.AttentionStep.__new__(step_mod.AttentionStep)
+    st.attn = attn
+    st.kv_before_wait = True
+    st.index_after_wait = slot and has_indexer
+    st.fused_wo_a = False
+    st.freqs = None
+    plugin = SimpleNamespace(wrote_fused=lambda lid: fused_wrote and lid == 3)
+    st.chain = (None, SimpleNamespace(indexer=plugin))
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def sparse_decode(*a, **kw):
+        seen.update(kw)
+        raise Stop
+
+    attn.maybe_use_decode_attn_tp = lambda fb: nullcontext()
+    view = SimpleNamespace(kv_pool=SimpleNamespace(uniform_fp8=False))
+    with (
+        mock.patch.object(prepare, "low_ratio", return_value="q"),
+        mock.patch.object(st, "takes_swapab", return_value=True),
+        mock.patch.object(st, "_prepare_path", side_effect=lambda *a: prepare.low_ratio),
+        mock.patch.object(chain, "sparse_decode", side_effect=sparse_decode),
+        pytest.raises(Stop),
+    ):
+        st.run(torch.zeros(6, 4), None, None, view=view)
+    assert seen["kv_before_wait"] is True
+    assert seen["extra_after_wait"] is want

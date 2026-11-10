@@ -78,6 +78,7 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
             qkv_a_bf16=qkv_a_bf16,
             index_q_mxfp8_in=chain_on and "index_q_mxfp8_in" in SLOTS,
             kv_before_wait="kv_before_wait" in SLOTS,
+            index_after_wait="attn_index_after_wait" in SLOTS,
             swapab_h8="swapab_h8" in SLOTS,
             wo_a_g1="wo_a_g1" in SLOTS,
         )
@@ -126,6 +127,8 @@ def _chain_kind(attn, step_: AttentionStep) -> str:
     )
     if step_.swapab and step_.kv_before_wait and step_.low_ratio:
         swapab += " (KV before the PDL wait)"
+        if step_.index_after_wait:
+            swapab += " (a stock selection after the wait)"
     parts.append(swapab)
     parts.append(
         f"fused wo_a 1-48 ({attn.n_local_groups} groups)"

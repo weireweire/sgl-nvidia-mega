@@ -144,6 +144,11 @@ def disable_reason(attn) -> str:
     return ""
 
 
+# slot attn_prewait's widths: GB300 micro-bench, 16 heads, -0.4..-0.7 us per layer at
+# 6 / 8 rows, +0.3..+0.6 at 1-4 rows (the wait has no slack there)
+PREWAIT_ROWS = range(6, 9)
+
+
 class AttentionStep:
     """One layer's attention in a covered step, over the layer's own modules."""
 
@@ -158,12 +163,21 @@ class AttentionStep:
         kv_before_wait: bool = False,
         swapab_h8: bool = False,
         wo_a_g1: bool = False,
+        attn_prewait: bool = False,
     ):
         self.attn = attn
         # swap-AB gathers the KV before its PDL wait on the low-ratio prepare (slot
         # "kv_before_wait")
         self.kv_before_wait = chain_ops and kv_before_wait
         self.low_ratio = attn.compress_ratio in (1, 2)
+        # slot attn_prewait: on a 16-head reuse layer (its top-k from an earlier layer)
+        self.prewait = (
+            self.kv_before_wait
+            and attn_prewait
+            and self.low_ratio
+            and getattr(attn, "indexer", None) is None
+            and attn.n_local_heads == 16
+        )
         # the attention chain's query ops, padded / roped query and unroped 16 heads
         self.chain = None
         if chain_ops:
@@ -270,7 +284,15 @@ class AttentionStep:
                 # before the query, so the attention may gather the KV before its wait
                 early = self.kv_before_wait and path is prepare.low_ratio
                 o = chain.sparse_decode(
-                    attn, view, q, positions, self.freqs, kv_before_wait=early
+                    attn,
+                    view,
+                    q,
+                    positions,
+                    self.freqs,
+                    kv_before_wait=early,
+                    stage_before_wait=(
+                        2 if early and self.prewait and rows in PREWAIT_ROWS else 0
+                    ),
                 )
                 tiles = _publish_row_tiles(rows, publish)
                 return ops.wo_b(

@@ -430,12 +430,21 @@ def _note_kv_before_wait(model: str, rows: int, layer_id: int) -> None:
 
 
 def sparse_decode(
-    attn, view, q, positions, freqs, *, kv_before_wait=False, model="target"
+    attn,
+    view,
+    q,
+    positions,
+    freqs,
+    *,
+    kv_before_wait=False,
+    stage_before_wait=0,
+    model="target",
 ):
     """Swap-AB on the 16 (or 8) local heads in place of the backend's swap-AB /
     FlashMLA choice; ropes ``q`` (unroped, [rows, heads, 512]) as it loads it. ``kv_before_wait``:
     gather the KV before the PDL wait, only where every KV and index writer joined
-    the step's stream before it (the low-ratio prepare)."""
+    the step's stream before it (the low-ratio prepare); ``stage_before_wait`` (slot
+    attn_prewait, see ``swapab.swapab_attention``) needs it."""
     swa, swa_indices, swa_lengths, extra, extra_indices, extra_lengths = resolve_caches(
         attn, view, q.shape[0]
     )
@@ -455,6 +464,7 @@ def sparse_decode(
         narrow_combine=True,
         q_rope=(freqs, positions),
         kv_before_wait=kv_before_wait,
+        stage_before_wait=stage_before_wait if kv_before_wait else 0,
         combine_entry_trigger=True,
     )
 

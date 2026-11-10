@@ -99,7 +99,10 @@ DRAFT_SLOTS = frozenset(
 # swapab_h8 / wo_a_g1: at attention TP8, swap-AB on the 8 local heads and the fused wo_a
 # on the 1 local group, target and draft, in place of SGLang's FlashMLA and einsum, which
 # TP8 runs (each bitwise to its TP4 kernel on the same heads / group, not to SGLang's
-# TP8 arm); no effect at TP4)
+# TP8 arm); no effect at TP4; attn_prewait: the target's swap-AB on a 16-head reuse layer
+# (low ratio, no indexer of its own) at 6-8 rows also stages its KV tile in shared memory and loads
+# the query's RoPE row before its PDL wait (bitwise; measured slower at 8 heads and on
+# index layers, where the wait has no slack)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -108,6 +111,7 @@ OPT_IN_SLOTS = (
     "lm_head_pinned_tactic",
     "swapab_h8",
     "wo_a_g1",
+    "attn_prewait",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -181,6 +185,7 @@ def slot_reasons() -> list[str]:
         ("draft_wo_b_ll", "draft_wo_a"),
         ("swapab_h8", "attn"),
         ("wo_a_g1", "attn"),
+        ("attn_prewait", "kv_before_wait"),
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")

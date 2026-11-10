@@ -78,6 +78,7 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
             kv_before_wait="kv_before_wait" in SLOTS,
             swapab_h8="swapab_h8" in SLOTS,
             wo_a_g1="wo_a_g1" in SLOTS,
+            attn_prewait="attn_prewait" in SLOTS,
         )
         if chain_on:
             ops0 = step_.chain[0]
@@ -117,7 +118,8 @@ def _chain_kind(attn, step_: AttentionStep) -> str:
         f"swap-AB 1-24 ({attn.n_local_heads} heads)" if step_.swapab else "no swap-AB"
     )
     if step_.swapab and step_.kv_before_wait and step_.low_ratio:
-        swapab += " (KV before the PDL wait)"
+        swapab += " (KV before the PDL wait"
+        swapab += ", staged with the RoPE row)" if step_.prewait else ")"
     parts.append(swapab)
     parts.append(
         f"fused wo_a 1-48 ({attn.n_local_groups} groups)"

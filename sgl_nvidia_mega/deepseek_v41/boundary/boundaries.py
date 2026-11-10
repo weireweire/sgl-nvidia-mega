@@ -437,8 +437,13 @@ class Boundaries:
         )
 
         # past SGLang's fused collective its FFN combine norms the streams itself;
-        # the streams match, the in-kernel norm can differ from it by an ULP
-        if not can_fuse_all_reduce(partial.shape[0], layer.hc_cfg.hidden):
+        # the streams match, the in-kernel norm can differ from it by an ULP. At TP8
+        # with EP2 SGLang has no fused collective at all (its combine always norms),
+        # so the kernel's norm stands in for that launch, as hop A's does
+        if not (
+            can_fuse_all_reduce(partial.shape[0], layer.hc_cfg.hidden)
+            or _tp8_ep2_fusable(layer, "attn")
+        ):
             return mhc.HcState(updated, pre)
         return mhc.HcState(updated, pre, mhc.HcNormed(normed))
 

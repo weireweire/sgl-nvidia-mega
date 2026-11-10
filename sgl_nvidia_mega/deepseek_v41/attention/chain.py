@@ -95,7 +95,8 @@ SGLANG_READS = {
         "get_extra_key_bytes_per_token",
     ),
     "srt/runtime_context.py": ("get_forward", '"sp_active"'),
-    "srt/environ.py": ("envs", "SGLANG_DSV41_FUSED_WO_A"),
+    # SGLANG_DSV41_FUSED_WO_A is read only where SGLang still defines it
+    "srt/environ.py": ("envs",),
 }
 
 
@@ -129,9 +130,12 @@ def fused_wo_a_applies(attn, one_group: bool = False) -> bool:
     from sglang.srt.environ import envs
     from sglang.srt.models.deepseek_v4 import _fused_wo_a_arch_supported
 
+    # SGLang's switch for its own fused wo_a; SGLang after 2026-11-06 dropped it and
+    # fuses wherever the shape allows, so a missing switch reads as on
+    switch = getattr(envs, "SGLANG_DSV41_FUSED_WO_A", None)
     return (
         attn.is_dsv41
-        and envs.SGLANG_DSV41_FUSED_WO_A.get()
+        and (switch is None or switch.get())
         and _fused_wo_a_arch_supported()
         and not attn.wo_a_fp8
         and not attn.use_npu_arch35_mxfp8_wo_a

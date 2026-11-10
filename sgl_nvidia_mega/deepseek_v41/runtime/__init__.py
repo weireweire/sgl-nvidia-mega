@@ -109,7 +109,10 @@ DRAFT_SLOTS = frozenset(
 # FlashInfer's own gate_up does, not after its stores;
 # target_lm_head_mxfp8 / draft_lm_head_mxfp8: the target's / the draft's LM head at 1-8
 # rows on an MXFP8 copy of the shard, a numerics change; the draft's is measurement only,
-# plan.MEASUREMENT_ONLY_SLOTS)
+# plan.MEASUREMENT_ONLY_SLOTS;
+# attn_indexer_narrow: slot attn_indexer at the swap-AB widths too (1-24 rows);
+# attn_indexer_fused: that, and the candidate consumers' logits + top-k at 1-8 rows in
+# one cluster launch, sm103/attention/reindex_select.py)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -125,6 +128,8 @@ OPT_IN_SLOTS = (
     "shared_fold_early_release",
     "target_lm_head_mxfp8",
     "draft_lm_head_mxfp8",
+    "attn_indexer_narrow",
+    "attn_indexer_fused",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -173,6 +178,8 @@ def slot_reasons() -> list[str]:
         ("hop_a_batch2", "hop_a"),
         ("attn_qkv_a", "attn"),
         ("attn_indexer", "attn"),
+        ("attn_indexer_narrow", "attn_indexer"),
+        ("attn_indexer_fused", "attn_indexer"),
         ("attn_qkv_a_bf16", "attn_qkv_a"),
         ("index_q_mxfp8_in", "attn"),
         ("hop_b", "hop_a"),
@@ -398,6 +405,16 @@ def build(model, ctx):
         "req_pos_once": "req_pos_once" in SLOTS,
         "attn_indexer": any(
             a.chain is not None and a.chain[0].indexer is not None
+            for a in bound["attention"].values()
+        ),
+        "attn_indexer_narrow": any(
+            a.chain is not None and a.chain[1].indexer is not None
+            for a in bound["attention"].values()
+        ),
+        "attn_indexer_fused": any(
+            a.chain is not None
+            and a.chain[0].indexer is not None
+            and a.chain[0].indexer.fused
             for a in bound["attention"].values()
         ),
         # the indexer wq_b on the chain's q_lora quant: indexer layers, 1-8 rows

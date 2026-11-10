@@ -59,10 +59,12 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
     kinds: Counter = Counter()
     # slot attn_indexer: one plugin indexer for every layer it takes
     step_indexer = (
-        indexer.StepIndexer(model.config)
+        indexer.StepIndexer(model.config, fused="attn_indexer_fused" in SLOTS)
         if chain_on and "attn_indexer" in SLOTS
         else None
     )
+    # slots attn_indexer_narrow / _fused: also the swap-AB widths' query ops
+    narrow_indexer = SLOTS & {"attn_indexer_narrow", "attn_indexer_fused"}
     for i in range(m.start_layer, m.end_layer):
         attn = m.layers[i].self_attn
         reason = disable_reason(attn)
@@ -87,6 +89,8 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
                 and not indexer.reason(attn, model.config)
             ):
                 ops0.indexer = step_indexer
+                if narrow_indexer:
+                    step_.chain[1].indexer = step_indexer
             chain.precompile(
                 attn, ctx.widths, qkv_a_ll=qkv_a_ll, wo_a_one_group="wo_a_g1" in SLOTS
             )
@@ -111,7 +115,11 @@ def _chain_kind(attn, step_: AttentionStep) -> str:
     if step_.chain[0].index_q_mxfp8_in:
         parts.append("indexer wq_b on the chain's q_lora quant 1-8")
     if step_.chain[0].indexer is not None:
-        parts.append("indexer top-k in the plugin 1-64 (query on stream 1)")
+        parts.append(
+            "indexer top-k in the plugin 1-64 (query on stream 1)"
+            + (", swap-AB widths too" if step_.chain[1].indexer is not None else "")
+            + (", fused consumers 1-8" if step_.chain[0].indexer.fused else "")
+        )
     parts.append("wq_b low-latency 1-48" if step_.chain[0].wq_b_ll else "wq_b SGLang's")
     swapab = (
         f"swap-AB 1-24 ({attn.n_local_heads} heads)" if step_.swapab else "no swap-AB"

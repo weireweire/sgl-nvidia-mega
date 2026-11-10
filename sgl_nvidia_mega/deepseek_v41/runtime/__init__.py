@@ -99,7 +99,9 @@ DRAFT_SLOTS = frozenset(
 # swapab_h8 / wo_a_g1: at attention TP8, swap-AB on the 8 local heads and the fused wo_a
 # on the 1 local group, target and draft, in place of SGLang's FlashMLA and einsum, which
 # TP8 runs (each bitwise to its TP4 kernel on the same heads / group, not to SGLang's
-# TP8 arm); no effect at TP4)
+# TP8 arm); no effect at TP4; gate_route: the router's top-k and the routed pair's route
+# record in one cluster launch at 1-8 rows, target and draft (sm103/moe/src/gate_route.cuh;
+# bitwise with gate_topk + route))
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -108,6 +110,7 @@ OPT_IN_SLOTS = (
     "lm_head_pinned_tactic",
     "swapab_h8",
     "wo_a_g1",
+    "gate_route",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -150,6 +153,7 @@ def slot_reasons() -> list[str]:
         ("gate", "moe"),
         ("shared_ll", "moe"),
         ("gate_wide", "gate"),
+        ("gate_route", "gate"),
         ("hop_a_batch2", "hop_a"),
         ("attn_qkv_a", "attn"),
         ("attn_indexer", "attn"),

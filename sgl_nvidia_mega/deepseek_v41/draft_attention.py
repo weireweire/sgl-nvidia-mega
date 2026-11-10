@@ -165,6 +165,8 @@ class Kernels(NamedTuple):
     # swap-AB gathers the KV before its PDL wait where the store joined first (slot
     # kv_before_wait)
     kv_before_wait: bool = False
+    # slot attn_q_norm_gemm: at 1-8 rows the qfront norm + quant inside wq_b's GEMM
+    q_norm_gemm: bool = False
 
 
 def wo_a_applies(attn, one_group: bool = False) -> bool:
@@ -200,11 +202,15 @@ def build(stages, slots: frozenset[str]) -> dict[int, Kernels]:
             continue
         fusable = "draft_qkv_a" in slots and not qkv_a_fusable(attn.wq_a, attn.wkv)
         wo_a = "draft_wo_a" in slots and wo_a_applies(attn, "wo_a_g1" in slots)
+        qfront = (
+            "draft_qfront" in slots
+            and not attn.q_head_norm
+            and chain.wq_b_ll_applies(attn)
+        )
         kernels[stage.layer_id] = Kernels(
             # the chain's query kernels have no per-head norm
-            qfront="draft_qfront" in slots
-            and not attn.q_head_norm
-            and chain.wq_b_ll_applies(attn),
+            qfront=qfront,
+            q_norm_gemm=qfront and "attn_q_norm_gemm" in slots,
             wo_a=wo_a,
             swapab="draft_swapab" in slots
             and chain.swapab_applies(attn, heads8="swapab_h8" in slots),
@@ -225,6 +231,7 @@ def build(stages, slots: frozenset[str]) -> dict[int, Kernels]:
 
 def precompile(stages, kernels: dict[int, Kernels], widths) -> None:
     """Compile the slots' kernels that do not depend on the KV pool, before capture."""
+    from sgl_nvidia_mega.deepseek_v41.sm103.attention import q_norm_gemm
     from sgl_nvidia_mega.deepseek_v41.sm103.attention.q_norm_quant import (
         rmsnorm_mxfp8,
     )
@@ -254,6 +261,13 @@ def precompile(stages, kernels: dict[int, Kernels], widths) -> None:
                     attn.q_norm.variance_epsilon,
                     pdl=True,
                     row_tiles=r > mxfp8_ll.MAX_ROWS,
+                )
+            if k.q_norm_gemm:
+                q_norm_gemm.precompile(
+                    attn.wq_b.weight,
+                    rows,
+                    attn.q_norm.variance_epsilon,
+                    consumer=chain.wq_b_consumer(attn),
                 )
         if k.wo_a:
             wo_a_kernel.precompile(
@@ -316,12 +330,12 @@ def forward(attn, x, positions, fb, *, kernels: Kernels, view):
         side.wait_stream(current)
         with torch.cuda.stream(side):
             kv = kv_and_store()
-        q = _compute_q(attn, x, positions, q_out, qkv_a, kernels.qfront, swapab)
+        q = _compute_q(attn, x, positions, q_out, qkv_a, kernels, swapab)
         current.wait_stream(side)
         store_joined = True
     else:
         kv = kv_and_store()
-        q = _compute_q(attn, x, positions, q_out, qkv_a, kernels.qfront, swapab)
+        q = _compute_q(attn, x, positions, q_out, qkv_a, kernels, swapab)
 
     if swapab:
         freqs = torch.view_as_real(attn.freqs_cis).flatten(-2)
@@ -358,17 +372,21 @@ def _swapab_takes(rows, fb, view) -> bool:
     )
 
 
-def _compute_q(attn, x, positions, q_out, qkv_a, qfront, swapab):
+def _compute_q(attn, x, positions, q_out, qkv_a, kernels: Kernels, swapab):
     """``DSparkAttention._compute_q`` (fast-kernel arm), on the fused GEMM's q columns,
     the chain's query kernels, or unroped for swap-AB."""
     from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
 
+    qfront = kernels.qfront
     if not (qfront or swapab or qkv_a is not None):
         return attn._compute_q(x, positions, q_out=q_out)
     q = qkv_a[:, : attn.q_lora_rank] if qkv_a is not None else attn.wq_a(x)[0]
     if qfront:
-        ops = chain.ChainOps(attn, rope_in_attention=swapab)
-        _, q = ops.normalize_q_lora(attn, q)
+        ops = chain.ChainOps(
+            attn, rope_in_attention=swapab, q_norm_gemm=kernels.q_norm_gemm
+        )
+        defer = ops.q_norm_gemm and ops.defers_norm(attn, q.shape[0])
+        _, q = ops.normalize_q_lora(attn, q, defer)
         return ops.compute_q_b(attn, q, positions, q_out)
     q, _ = attn.wq_b(attn.q_norm(q))
     q = q.view(-1, attn.n_local_heads, attn.head_dim)

@@ -124,6 +124,9 @@ class Query(NamedTuple):
     q_fp4: torch.Tensor  # [rows, 1, heads, 64]
     q_sf: torch.Tensor  # [rows, 1, heads]
     weights: torch.Tensor  # [rows, heads] fp32
+    # slot attn_index_weights_bf16: ``weights`` as BF16 (exact: they are BF16 values),
+    # made beside the head weights before q_lora; the BF16 scorers read it uncast
+    weights_bf16: Optional[torch.Tensor] = None
 
 
 class Table(NamedTuple):
@@ -226,19 +229,30 @@ class StepIndexer:
         input, so they run before q_lora is ready."""
         return attn.indexer.head_weights_raw(x)
 
-    def query(self, attn, q_quant, head_weights, positions) -> Query:
+    @staticmethod
+    def weights_bf16(attn, head_weights) -> torch.Tensor:
+        """The head weights as SGLang's ``head_weights(x)`` rounds them (BF16 of the
+        FP32 product), which ``index_q_rope_pack_weights`` widens to FP32: the BF16
+        scorers' input without the cast in front of them."""
+        return head_weights * attn.indexer.head_weight_scale
+
+    def query(self, attn, q_quant, head_weights, positions, weights_bf16=None) -> Query:
         """``_index_q_and_weights`` with the wq_b on the low-latency GEMM (the chain's
         q_lora quant: 128x4 scales to 8 rows, row tiles past)."""
+        wq_b = attn.indexer.wq_b
+        q = mxfp8_ll.linear(
+            q_quant.quant, q_quant.scale, wq_b.weight, wq_b.weight_scale_inv_swizzled
+        )
+        return self.pack(attn, q, head_weights, positions, weights_bf16)
+
+    def pack(self, attn, q, head_weights, positions, weights_bf16=None) -> Query:
+        """The index query's RoPE + FP4 pack + head weights on the wq_b output ``q``."""
         from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
             index_q_rope_pack_weights,
         )
 
         indexer = attn.indexer
-        wq_b = indexer.wq_b
         rows, heads = head_weights.shape[0], indexer.n_local_heads
-        q = mxfp8_ll.linear(
-            q_quant.quant, q_quant.scale, wq_b.weight, wq_b.weight_scale_inv_swizzled
-        )
         q_fp4, q_sf, weights = index_q_rope_pack_weights(
             q.view(rows, heads, indexer.index_head_dim),
             torch.view_as_real(attn.freqs_cis).flatten(-2),
@@ -246,7 +260,12 @@ class StepIndexer:
             head_weights,
             indexer.head_weight_scale,
         )
-        return Query(q_fp4.view(rows, 1, heads, 64), q_sf.view(rows, 1, heads), weights)
+        return Query(
+            q_fp4.view(rows, 1, heads, 64),
+            q_sf.view(rows, 1, heads),
+            weights,
+            weights_bf16,
+        )
 
     def topk(self, attn, data: Query, req, view) -> None:
         """``_low_ratio_index_topk`` (decode branch) on the current stream: writes the
@@ -317,7 +336,7 @@ class StepIndexer:
         return deep_gemm_fp4_paged_mqa_logits(
             (q_fp4, q_sf),
             k_cache,
-            data.weights,
+            data.weights if data.weights_bf16 is None else data.weights_bf16,
             lens,
             table,
             paged.deep_gemm_metadata,
@@ -442,7 +461,9 @@ class StepIndexer:
             data.q_fp4,
             data.q_sf,
             k_cache,
-            data.weights.to(torch.bfloat16),
+            data.weights.to(torch.bfloat16)
+            if data.weights_bf16 is None
+            else data.weights_bf16,
             table.schedule,
             table.blocks.shape[1],
         )

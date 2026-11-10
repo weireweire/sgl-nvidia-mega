@@ -12,10 +12,21 @@
   logits, local-shard and full-vocab base logits, three launches and a CUDA graph
   replay with the noise forked onto its side stream. Rows at temperature 0 leave their
   step logits untouched. A missing rank's fault is in test_deepseek_v41_fail_stop.py.
+- The same on every rank of a torchrun job (world 2, 4 or 8; world 8 is attention TP8 on
+  two GB300 trays).
+- Slot markov_lowlat's kernel (converged pollers, acquire loads, the direct exchange to
+  4 rows at world 4 and 2 at world 8, the narrow kernel to 8 rows at every world): the
+  same SGLang checks, and bit for bit the current kernel's tokens and kept logits over
+  many CUDA-graph-replayed draft blocks with Gaussian (not exactly summing) weights at
+  1-8 rows, greedy, sampled and mixed temperatures (at world 8, 5-8 rows against the
+  current wide kernel).
 
-Run with ``python -m pytest test/kernels/test_deepseek_v41_draft.py -s``.
+Run with ``python -m pytest test/kernels/test_deepseek_v41_draft.py -s``; the ranks'
+cases with ``torchrun --nproc_per_node 4 -m pytest -k ranks ...`` (world 8:
+``torchrun --nnodes 2 --nproc_per_node 4 ...``).
 """
 
+import os
 import sys
 from types import SimpleNamespace
 
@@ -150,7 +161,7 @@ def _assert_cache(cache, want_cache, temperatures, rows: int, what) -> None:
     assert not cache[:rows][~keeps].any(), what
 
 
-def _make(group, rank, world, w1, w2, max_bs=MAX_BS, keeps_logits=True):
+def _make(group, rank, world, w1, w2, max_bs=MAX_BS, keeps_logits=True, lowlat=False):
     return markov.ShardedMarkov(
         embed_weight=w1,
         head_weight=w2,
@@ -163,15 +174,16 @@ def _make(group, rank, world, w1, w2, max_bs=MAX_BS, keeps_logits=True):
         max_bs=max_bs,
         deadline_s=DEADLINE_S,
         keeps_logits=keeps_logits,
+        lowlat=lowlat,
     )
 
 
-def _check_equal(device, group, rank: int, world: int, base_dtype, seed: int):
+def _check_equal(device, group, rank: int, world: int, base_dtype, seed: int, lowlat=False):
     g = torch.Generator().manual_seed(seed)
     w1, w2 = _ternary(g, device, VOCAB, RANK), _ternary(g, device, VOCAB, RANK)
-    chain = _make(group, rank, world, w1, w2)
+    chain = _make(group, rank, world, w1, w2, lowlat=lowlat)
     # A greedy draft's chain has no logit staging; it serves greedy blocks only.
-    greedy_chain = _make(group, rank, world, w1, w2, keeps_logits=False)
+    greedy_chain = _make(group, rank, world, w1, w2, keeps_logits=False, lowlat=lowlat)
     shard = slice(rank * VOCAB // world, (rank + 1) * VOCAB // world)
     offset = torch.tensor([3], dtype=torch.int64, device=device)
     for rows in (1, 2, 4, 8):
@@ -260,9 +272,93 @@ def _check_forked_graph(device, chain, w1, w2, shard, base_dtype, g):
 
 
 @needs_gpu
+@pytest.mark.parametrize("lowlat", [False, True], ids=["current", "lowlat"])
 @pytest.mark.parametrize("base_dtype", [torch.bfloat16, torch.float32])
-def test_one_rank_matches_markov_sample_step(base_dtype):
-    _check_equal(torch.device("cuda"), None, 0, 1, base_dtype, seed=1)
+def test_one_rank_matches_markov_sample_step(base_dtype, lowlat):
+    _check_equal(torch.device("cuda"), None, 0, 1, base_dtype, seed=1, lowlat=lowlat)
+
+
+# Blocks per (rows, temperatures) of the replay comparison.
+REPLAY_BLOCKS = 300
+
+
+def _compare_replays(device, group, rank: int, world: int, seed: int) -> dict:
+    """Slot markov_lowlat's chain against the current one, both CUDA graphs of one draft
+    block (noise forked onto the side stream when a row samples) over the same inputs,
+    replayed REPLAY_BLOCKS times per row count and temperature set; mismatch counts."""
+    g = torch.Generator().manual_seed(seed)  # the same weights on every rank
+    w1 = (torch.randn(VOCAB, RANK, generator=g) * 0.05).to(device, torch.bfloat16)
+    w2 = (torch.randn(VOCAB, RANK, generator=g) * 0.05).to(device, torch.bfloat16)
+    chains = {lowlat: _make(group, rank, world, w1, w2, lowlat=lowlat) for lowlat in (False, True)}
+    vocab_local = VOCAB // world
+    shard = slice(rank * vocab_local, (rank + 1) * vocab_local)
+    offset = torch.zeros(1, dtype=torch.int64, device=device)
+    counts = {"blocks": 0, "tokens": 0, "logits": 0, "distinct": 0}
+    for temps in TEMPERATURE_SETS:
+        temperatures = torch.tensor(temps, device=device)
+        for rows in range(1, MAX_BS + 1):
+            sampled = any(t != 0.0 for t in temps[:rows])
+            base = torch.zeros(rows, STEPS, vocab_local, dtype=torch.bfloat16, device=device)
+            anchor = torch.zeros(rows, dtype=torch.int64, device=device)
+            out = {
+                lowlat: (
+                    torch.full((MAX_BS, STEPS), -7, dtype=torch.int64, device=device),
+                    torch.zeros(MAX_BS, STEPS, VOCAB, device=device),
+                )
+                for lowlat in chains
+            }
+            graphs = {}
+            for lowlat, chain in chains.items():
+                tokens, cache = out[lowlat]
+
+                def block(chain=chain, tokens=tokens, cache=cache):
+                    if sampled:
+                        chain.fork_noise(rows=rows, key=KEY, offset=offset)
+                        chain.join_noise()
+                    chain.sample(
+                        base_logits=base,
+                        anchor_tokens=anchor,
+                        temperatures=temperatures,
+                        logits_cache=cache if sampled else None,
+                        draft_tokens=tokens,
+                    )
+
+                side = torch.cuda.Stream(device)
+                side.wait_stream(torch.cuda.current_stream(device))
+                with torch.cuda.stream(side):
+                    block()
+                torch.cuda.current_stream(device).wait_stream(side)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    block()
+                graphs[lowlat] = graph
+            keeps = (temperatures[:rows] != 0).view(rows, 1, 1)
+            first = set()
+            for i in range(REPLAY_BLOCKS):
+                # the same values on every rank (one seed, one device generator algorithm)
+                gen = torch.Generator(device=device).manual_seed(seed * 100_003 + i)
+                full = torch.randn(rows, STEPS, VOCAB, generator=gen, device=device) * 3
+                base.copy_(full[:, :, shard])
+                anchor.copy_(torch.randint(0, VOCAB, (rows,), generator=gen, device=device))
+                offset.fill_(1000 + i)
+                for lowlat in chains:
+                    graphs[lowlat].replay()
+                (t0, c0), (t1, c1) = out[False], out[True]
+                counts["blocks"] += 1
+                counts["tokens"] += int((t0[:rows] != t1[:rows]).sum())
+                if sampled:
+                    counts["logits"] += int(((c0[:rows] != c1[:rows]) & keeps).sum())
+                first.add(int(t0[0, 0]))
+            counts["distinct"] += len(first)
+    torch.cuda.synchronize(device)
+    return counts
+
+
+@needs_gpu
+def test_one_rank_lowlat_is_the_current_kernel_over_graph_replays():
+    counts = _compare_replays(torch.device("cuda"), None, 0, 1, seed=5)
+    assert counts["tokens"] == 0 and counts["logits"] == 0, counts
+    assert counts["distinct"] > counts["blocks"] // 4, counts  # the blocks differ
 
 
 def _pdl_chain(device, pdl: bool, seed: int, blocks: int, temps):
@@ -346,6 +442,46 @@ def test_markov_pdl_behind_the_low_m_lm_head_is_bitwise(temps):
     assert torch.equal(got[0], want[0])
     assert torch.equal(got[1], want[1])
     assert len(set(want[0][:, 0].tolist())) > 100  # the blocks differ
+
+
+_TORCHRUN = "RANK" in os.environ and int(os.environ.get("WORLD_SIZE", "1")) > 1
+
+
+@pytest.fixture(scope="module")
+def ranks():
+    """This torchrun rank's device and CPU group (one process group per module)."""
+    import torch.distributed as dist
+
+    world, rank = int(os.environ["WORLD_SIZE"]), int(os.environ["RANK"])
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(device)
+    dist.init_process_group("cpu:gloo,cuda:nccl", rank=rank, world_size=world)
+    group = dist.new_group(list(range(world)), backend="gloo")
+    yield device, group, rank, world
+    dist.barrier(group=group)
+    dist.destroy_process_group()
+
+
+@needs_gpu
+@pytest.mark.skipif(not _TORCHRUN, reason="runs on every rank of a torchrun job")
+@pytest.mark.parametrize("lowlat", [False, True], ids=["current", "lowlat"])
+@pytest.mark.parametrize("base_dtype", [torch.bfloat16, torch.float32])
+def test_ranks_match_markov_sample_step(ranks, base_dtype, lowlat):
+    """Every rank's sharded chain draws SGLang's tokens and keeps its full-vocab step
+    logits; the same seed on every rank, so all ranks agree on the reference."""
+    device, group, rank, world = ranks
+    assert world in markov.SUPPORTED_WORLDS
+    _check_equal(device, group, rank, world, base_dtype, seed=2, lowlat=lowlat)
+
+
+@needs_gpu
+@pytest.mark.skipif(not _TORCHRUN, reason="runs on every rank of a torchrun job")
+def test_ranks_lowlat_is_the_current_kernel_over_graph_replays(ranks):
+    device, group, rank, world = ranks
+    counts = _compare_replays(device, group, rank, world, seed=6)
+    print(f"rank {rank} world {world}: {counts}", flush=True)
+    assert counts["tokens"] == 0 and counts["logits"] == 0, counts
+    assert counts["distinct"] > counts["blocks"] // 4, counts
 
 
 if __name__ == "__main__":

@@ -230,6 +230,7 @@ def build_steps(
         deadline_s=deadline_s,
         keeps_logits=not greedy_draft,
         pdl="markov_pdl" in SLOTS,
+        lowlat="markov_lowlat" in SLOTS,
     )
     lm_head = DraftLmHead(
         lm.lm_head,

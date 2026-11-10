@@ -89,6 +89,7 @@ DRAFT_SLOTS = frozenset(
         "draft_qkv_a_ll",
         "draft_wo_b_ll",
         "markov_pdl",
+        "markov_lowlat",
     }
 )
 # Slots that run only when listed (draft_embed: the draft's tokens from the target's
@@ -98,7 +99,10 @@ DRAFT_SLOTS = frozenset(
 # hop B's finalize-publish lets the consumer launch right after its own wait, not at its end;
 # lm_head_pinned_tactic: the low-M LM heads on one fixed tactic per row count, untuned;
 # markov_pdl: the draft's Markov chain launched as a programmatic dependent of the draft
-# LM head, loading its head tiles before the wait, the anchors staged before the LM head)
+# LM head, loading its head tiles before the wait, the anchors staged before the LM head;
+# markov_lowlat: the Markov chain's low-latency exchange, converged pollers and acquire
+# loads, the direct exchange to 4 rows at world 4 and 2 at world 8, the narrow kernel to
+# 8 rows at every world; bitwise)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -106,6 +110,7 @@ OPT_IN_SLOTS = (
     "hop_b_quad_trigger",
     "lm_head_pinned_tactic",
     "markov_pdl",
+    "markov_lowlat",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -162,6 +167,7 @@ def slot_reasons() -> list[str]:
         ("hop_b_quad_trigger", "hop_b"),
         ("draft_lm_head", "markov"),
         ("markov_pdl", "markov"),
+        ("markov_lowlat", "markov"),
         ("kv_before_wait", "attn"),
         ("draft_moe", "draft"),
         ("draft_gate", "draft_moe"),

@@ -71,11 +71,18 @@ MAX_CTAS = 256
 WIDE_CONTROL_WORDS = 1280 + MAX_CTAS
 WIDE_RECORD_BYTES = 2 * MAX_STEPS * WIDE_ROWS * MAX_RANKS * 8
 NOISE_BLOCK = 1024
+# Phase stamps (instrumentation, markov.cu kStampRing / kStampSlots).
+STAMP_RING = 16
+STAMP_SLOTS = 80
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3))
 SUPPORTED_WORLDS = (1, 2, 4, MAX_RANKS)
 # Measured on GB300 TP4: the direct exchange wins at 1 row, the rank-local fold at 2-8.
 DIRECT_MAX_ROWS = 1
+# With slot markov_lowlat (converged pollers), measured on GB300: the direct exchange wins
+# to 4 rows at world 4 and to 2 rows at world 8 (64 CTAs a rank, 8 ranks).
+DIRECT_MAX_ROWS_LOWLAT = 4
+DIRECT_MAX_ROWS_LOWLAT_WORLD8 = 2
 
 # markov_sample.py's Philox draft noise.
 _UNIFORM_SCALE = tl.constexpr(2.3283064365386963e-10)
@@ -149,9 +156,17 @@ def unsupported_reason(
     return None
 
 
-def narrow_row_limit(*, world: int, max_bs: int) -> int:
-    """Request rows of the narrow kernel: its exchange gives each (row, rank) pair one lane."""
-    return max(1, min(MAX_ROWS, 32 // world, max_bs))
+def narrow_row_limit(*, world: int, max_bs: int, lowlat: bool = False) -> int:
+    """Request rows of the narrow kernel: its exchange gives each (row, rank) pair one
+    lane (slot markov_lowlat: a second pass, so 8 rows at every world)."""
+    return max(1, min(MAX_ROWS, MAX_ROWS if lowlat else 32 // world, max_bs))
+
+
+def direct_row_limit(*, world: int, lowlat: bool) -> int:
+    """Rows up to which the narrow kernel takes the direct exchange (the fold above)."""
+    if not lowlat:
+        return DIRECT_MAX_ROWS
+    return DIRECT_MAX_ROWS_LOWLAT if world <= 4 else DIRECT_MAX_ROWS_LOWLAT_WORLD8
 
 
 def direct_mailbox_bytes(*, steps: int, world: int, ctas: int, max_rows: int) -> int:
@@ -160,14 +175,23 @@ def direct_mailbox_bytes(*, steps: int, world: int, ctas: int, max_rows: int) ->
 
 
 def nvrtc_defines(
-    *, steps: int, base_dtype: torch.dtype, cache_dtype: torch.dtype, direct: bool
+    *,
+    steps: int,
+    base_dtype: torch.dtype,
+    cache_dtype: torch.dtype,
+    direct: bool,
+    stamps: bool = False,
+    lowlat: bool = False,
+    extra: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
-    return (
+    defines = (
         f"-DBASE_T={_C_TYPES[base_dtype]}",
         f"-DCACHE_T={_C_TYPES[cache_dtype]}",
         f"-DMARKOV_DIRECT={int(direct)}",
         f"-DSTEPS={steps}",
     )
+    defines += ("-DMARKOV_LOWLAT=1",) if lowlat else ()
+    return defines + (("-DMARKOV_STAMPS=1",) if stamps else ()) + tuple(extra)
 
 
 def compile_cubin(
@@ -177,10 +201,19 @@ def compile_cubin(
     cache_dtype: torch.dtype,
     direct: bool,
     arch: str,
+    stamps: bool = False,
+    lowlat: bool = False,
+    extra: tuple[str, ...] = (),
 ) -> bytes:
     """The module of one exchange: the narrow kernel, plus the wide kernel with the fold."""
     options = NVRTC_OPTIONS + nvrtc_defines(
-        steps=steps, base_dtype=base_dtype, cache_dtype=cache_dtype, direct=direct
+        steps=steps,
+        base_dtype=base_dtype,
+        cache_dtype=cache_dtype,
+        direct=direct,
+        stamps=stamps,
+        lowlat=lowlat,
+        extra=extra,
     )
     return _compile_source(SOURCE.read_text(), "markov", arch, options)
 
@@ -197,6 +230,9 @@ def load_kernels(
     base_dtype: torch.dtype,
     cache_dtype: torch.dtype,
     direct: bool,
+    stamps: bool = False,
+    lowlat: bool = False,
+    extra: tuple[str, ...] = (),
 ) -> dict[str, _Kernel]:
     """Compile (or read from the cache) and load one exchange's kernels."""
     cu = _driver()
@@ -208,6 +244,9 @@ def load_kernels(
         cache_dtype=cache_dtype,
         direct=direct,
         arch=f"sm_{major}{minor}a",
+        stamps=stamps,
+        lowlat=lowlat,
+        extra=extra,
     )
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     symbols = {"narrow": NARROW_SYMBOL}
@@ -295,6 +334,9 @@ class ShardedMarkov:
         deadline_s: float,
         keeps_logits: bool,
         pdl: bool = False,
+        stamps: bool = False,
+        lowlat: bool = False,
+        extra_defines: tuple[str, ...] = (),
     ):
         device = embed_weight.device
         reason = unsupported_reason(
@@ -323,6 +365,12 @@ class ShardedMarkov:
         # slot markov_pdl: launched as a programmatic dependent of the LM head, the
         # chain loads its head tiles while the LM head drains (stage_anchor first)
         self.pdl = pdl
+        # instrumentation: the narrow kernel records phase stamps into self.stamps
+        self.stamp_phases = stamps
+        self.extra_defines = tuple(extra_defines)
+        # slot markov_lowlat: the converged direct exchange up to DIRECT_MAX_ROWS_LOWLAT rows
+        self.lowlat = lowlat
+        self.direct_max_rows = direct_row_limit(world=world, lowlat=lowlat)
         self.vocab_local = vocab_size // world
         self.vocab_offset = rank * self.vocab_local
         self.embed_weight = embed_weight
@@ -336,7 +384,7 @@ class ShardedMarkov:
             raise ValueError(
                 f"the Markov chain counts launches for up to {MAX_CTAS} CTAs, not {self.ctas}"
             )
-        self.narrow_rows = narrow_row_limit(world=world, max_bs=max_bs)
+        self.narrow_rows = narrow_row_limit(world=world, max_bs=max_bs, lowlat=lowlat)
         # The wide kernel takes more rows when every warp owns one head tile.
         wide = max_bs > self.narrow_rows and self.ctas * WARPS >= tiles
         self.wide_rows = min(WIDE_ROWS, max_bs) if wide else 0
@@ -353,6 +401,14 @@ class ShardedMarkov:
         self.sampled_rows = rows.repeat_interleave(num_steps)
         self.inert_rows = torch.full_like(self.sampled_rows, -1)
         self.anchor = torch.zeros(self.max_rows, dtype=torch.int32, device=device)
+        # [launch % STAMP_RING, cta, STAMP_SLOTS, (globaltimer ns, clock64)]
+        self.stamps = (
+            torch.zeros(
+                STAMP_RING, self.ctas, STAMP_SLOTS, 2, dtype=torch.int64, device=device
+            )
+            if stamps
+            else None
+        )
         size = self._layout_peer_buffer(keeps_logits=keeps_logits)
         self.wide_control = (
             torch.zeros(WIDE_CONTROL_WORDS, dtype=torch.int32, device=device)
@@ -402,7 +458,7 @@ class ShardedMarkov:
         """``narrow-direct``, ``narrow-fold`` and ``wide``: those a launch may pick."""
         names = []
         for rows in range(1, self.narrow_rows + 1):
-            name = "narrow-direct" if rows <= DIRECT_MAX_ROWS else "narrow-fold"
+            name = "narrow-direct" if rows <= self.direct_max_rows else "narrow-fold"
             if name not in names:
                 names.append(name)
         if self.wide_rows:
@@ -421,6 +477,9 @@ class ShardedMarkov:
                     base_dtype,
                     self.cache_dtype,
                     name == "narrow-direct",
+                    self.stamp_phases,
+                    self.lowlat,
+                    self.extra_defines,
                 )
                 kernel = module["wide" if name == "wide" else "narrow"]
                 if self.ctas > kernel.max_ctas:
@@ -524,7 +583,7 @@ class ShardedMarkov:
         # Host-static per row count, so a CUDA graph of one batch size captures one kernel.
         if wide:
             name = "wide"
-        elif rows <= DIRECT_MAX_ROWS:
+        elif rows <= self.direct_max_rows:
             name = "narrow-direct"
         else:
             name = "narrow-fold"
@@ -555,6 +614,8 @@ class ShardedMarkov:
             ctypes.c_int64(self.timeout_ns),
             ctypes.c_int64(self.wide_offset if wide else self.mailbox_offset),
         ]
+        if self.stamp_phases and not wide:
+            arguments.append(_pointer(self.stamps))
         stream = torch.cuda.current_stream(self.device).cuda_stream
         _launch_cooperative(
             self._kernels[base_logits.dtype, name],

@@ -293,7 +293,18 @@ def model_disable_reasons(model) -> list[str]:
 
 def built_slots(slots: dict, bound: dict, facts: Any) -> dict[str, bool]:
     """Each shipped slot: whether its build serves at least one width."""
+    folds = [
+        getattr(slot.shared, "fold", None)
+        for slot in getattr(bound["moe"], "slots", {}).values()
+        if slot.shared is not None
+    ]
+    folds = [fold for fold in folds if fold is not None]
     return {
+        # slots shared_fold*: a shared expert's gate_up folds the SwiGLU (and the quant,
+        # and releases down_proj early); a fold that steps aside leaves them unbuilt
+        "shared_fold": bool(folds),
+        "shared_fold_quant": any(fold.buffers is not None for fold in folds),
+        "shared_fold_early_release": any(fold.early_release for fold in folds),
         "hop_a": any(s.hop_a for s in slots.values()),
         "moe": facts.routed,
         # the MoE build's own result: a layer's fast top-k may fail to build alone
@@ -458,8 +469,11 @@ def build(model, ctx):
             f"{getattr(bound['moe'], 'shared_reason', '') or 'built'}; embedding: "
             f"{embed_reason or 'built'}; Engram prefetch: {engram.reason or 'built'})"
         )
+    # the requested slots that serve: a slot built but not requested (hop_mbar,
+    # hop_b_quad_trigger follow from hop A / hop B) does not run, so it is not listed
+    active = sorted(name for name, on in built.items() if on and name in SLOTS)
     summary = (
-        f"slots {sorted(name for name, on in built.items() if on) or 'none (stock)'}; "
+        f"slots {active or 'none (stock)'}; "
         f"hop A at {[w for w, x in slots.items() if x.hop_a]} rows, fast gate at "
         f"{[w for w, x in slots.items() if x.fast_gate]} rows, Engram prefetch at "
         f"{[w for w, x in slots.items() if x.engram_prefetch]} rows "

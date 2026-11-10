@@ -95,6 +95,7 @@ def swapab_attention(
     q_rope=None,
     kv_before_wait=False,
     combine_entry_trigger=False,
+    extra_after_wait=False,
 ):
     """V4-layout attention on 16 (TP4) or 8 (TP8) heads; `extra_*` is a second slot range appended
     to each request's keys, and the attention sink is folded in exactly once.
@@ -102,7 +103,10 @@ def swapab_attention(
     combine as one-warp programs over 128 columns. `q_rope` = (fp32 [pos, 64] freqs,
     positions [b]) applies the query RoPE as Q loads. `kv_before_wait` gathers the KV
     rows before the PDL wait: the caller guarantees that only Q is still in flight.
-    `combine_entry_trigger` launches the combine's dependent at the combine's entry."""
+    `extra_after_wait` (with `kv_before_wait`): only the window rows are gathered before
+    the wait; the extra range's indices and lengths come from the PDL predecessor (the
+    layer's top-k). `combine_entry_trigger` launches the combine's dependent at the
+    combine's entry."""
     from .swapab_gluon import partial_gluon  # Gluon imports only where it runs
 
     block = 64
@@ -168,6 +172,11 @@ def swapab_attention(
         **({"USE_GDC": True, "launch_pdl": True} if pdl else {}),
         **(_q_rope_kwargs(q_rope, b) if q_rope is not None else {}),
         **({"KV_BEFORE_WAIT": True} if pdl and kv_before_wait else {}),
+        **(
+            {"EXTRA_AFTER_WAIT": True}
+            if pdl and kv_before_wait and extra_after_wait and ne
+            else {}
+        ),
         **({"HQ": h} if h != NUM_HEADS else {}),
     )
     bd = 64 if ne else 512

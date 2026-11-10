@@ -52,6 +52,8 @@ def _plugin():
     p.topk_blocks, p.stream, p.check = 4, None, False
     p._served_rows, p._declined, p.compared, p.differ = set(), {}, 0, 0
     p._meta, p._serves, p._table = None, False, None
+    p.fused, p._fused_logged, p._fused_now = False, set(), False
+    p._fused_layer = None
     return p
 
 
@@ -422,3 +424,222 @@ def test_the_check_ignores_the_emission_order(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     p.compare(SimpleNamespace(compress_ratio=1), view, lambda: out.copy_(out.flip(-1)))
     assert p.differ == 0
+
+
+# ---------------------------------------------- slot attn_indexer_fused: the consumers
+
+
+@pytest.mark.parametrize(
+    "rows, width, topk, page_size, heads, declined",
+    [
+        (6, 16384, 512, 256, 32, False),
+        (1, 16384, 512, 128, 32, False),
+        (8, 16384, 512, 64, 32, False),
+        (0, 16384, 512, 256, 32, True),
+        (9, 16384, 512, 256, 32, True),  # past one wave of 16-CTA clusters
+        (12, 16384, 512, 256, 32, True),
+        (6, 8192, 512, 256, 32, True),  # another candidate span
+        (6, 16384, 4096, 256, 32, True),  # past the stock top-k's k
+        (6, 16384, 512, 96, 32, True),  # pages of a non-power-of-two block count
+        (6, 16384, 512, 12, 32, True),
+        (6, 16384, 512, 256, 64, True),  # sharded or other index heads
+    ],
+)
+def test_the_fused_consumer_declines_what_it_does_not_reproduce(
+    rows, width, topk, page_size, heads, declined
+):
+    from sgl_nvidia_mega.deepseek_v41.sm103.attention import reindex_select
+
+    assert bool(reindex_select.reason(rows, width, topk, page_size, heads)) is declined
+
+
+def _consumer_call(p, rows, log):
+    attn = SimpleNamespace(
+        compress_ratio=1,
+        layer_id=9,
+        indexer=SimpleNamespace(is_candidate_source=False, uses_candidates=True),
+    )
+    data = indexer.Query(
+        torch.zeros(rows, 1, 32, 64), torch.zeros(rows, 1, 32), torch.zeros(rows, 32)
+    )
+    out = torch.zeros(rows, 512, dtype=torch.int32)
+    view = _view(_paged())
+    view.metadata.core_metadata = SimpleNamespace(sparse_page_indices=lambda r: out)
+    p._table = indexer.Table(torch.zeros(rows, 2048), "s", "pb", "vl", "ready")
+    with (
+        _ops_modules(log),
+        mock.patch(
+            "sglang.srt.model_executor.runner_utils.capture_mode.skip_low_ratio_indexer",
+            return_value=False,
+        ),
+        mock.patch(
+            "sglang.srt.model_executor.runner_utils.capture_mode.skip_candidate_filtering",
+            return_value=False,
+        ),
+        mock.patch.object(torch.cuda, "current_stream"),
+        mock.patch(
+            "sgl_nvidia_mega.deepseek_v41.sm103.attention.reindex_select.reindex_select",
+            side_effect=lambda *a, **kw: log.append(
+                ("fused", kw["inputs_before_wait"])
+            ),
+        ),
+        mock.patch.object(
+            sys.modules["sglang.srt.layers.attention.dsv4.v41_indexer.scoring"],
+            "get_index_k_cache",
+            lambda **kw: log.append("k_cache") or torch.zeros(4, 256, 1, 68),
+        ),
+    ):
+        p.topk(attn, data, None, view)
+
+
+@pytest.mark.parametrize(
+    "fused, rows, want",
+    [
+        (True, 6, ["k_cache", ("fused", True)]),
+        (True, 1, ["k_cache", ("fused", True)]),
+        (True, 8, ["k_cache", ("fused", True)]),
+        (True, 12, ["k_cache", "sparse_logits", "topk_sparse"]),  # past 8 rows
+        (False, 6, ["k_cache", "sparse_logits", "topk_sparse"]),  # slot off
+    ],
+)
+def test_a_consumer_takes_the_fused_kernel_where_it_applies(fused, rows, want):
+    """The fused launch replaces the sparse logits and the sparse top-k (one launch,
+    reading its inputs before the PDL wait); past it the stock pair runs."""
+    log = []
+    p = _plugin()
+    p.topk_blocks, p.fused = 2048, fused
+    _consumer_call(p, rows, log)
+    assert log == want
+    assert p._fused_now is (want[-1] == ("fused", True))
+
+
+def test_sources_and_full_layers_keep_the_stock_kernels_with_the_slot():
+    log = []
+    p = _plugin()
+    p.topk_blocks, p.fused = 2048, True
+    attn = SimpleNamespace(
+        compress_ratio=1,
+        layer_id=7,
+        indexer=SimpleNamespace(is_candidate_source=False, uses_candidates=False),
+    )
+    data = indexer.Query(
+        torch.zeros(6, 1, 32, 64), torch.zeros(6, 1, 32), torch.zeros(6, 32)
+    )
+    with (
+        _ops_modules(log),
+        mock.patch(
+            "sglang.srt.model_executor.runner_utils.capture_mode.skip_low_ratio_indexer",
+            return_value=False,
+        ),
+        mock.patch(
+            "sglang.srt.model_executor.runner_utils.capture_mode.skip_candidate_filtering",
+            return_value=False,
+        ),
+        mock.patch(
+            "sgl_nvidia_mega.deepseek_v41.sm103.attention.reindex_select.reindex_select",
+            side_effect=AssertionError("a full layer took the consumer kernel"),
+        ),
+    ):
+        p.topk(attn, data, None, _view(_paged()))
+    assert log == ["k_cache", "paged_logits", "topk_full"]
+
+
+def test_the_fused_slot_needs_attn_indexer(monkeypatch):
+    from sgl_nvidia_mega.deepseek_v41 import runtime
+
+    for slots, needs in (
+        ({"attn", "attn_indexer_fused"}, "attn_indexer"),
+        ({"attn", "attn_indexer_narrow"}, "attn_indexer"),
+    ):
+        monkeypatch.setattr(runtime, "SLOTS", frozenset(slots))
+        reasons = runtime.slot_reasons()
+        assert any(f"needs slot {needs!r}" in r for r in reasons), reasons
+    monkeypatch.setattr(
+        runtime, "SLOTS", frozenset({"attn", "attn_indexer", "attn_indexer_fused"})
+    )
+    assert runtime.slot_reasons() == []
+    assert "attn_indexer_fused" not in runtime.SHIPPED_SLOTS
+
+
+@pytest.mark.parametrize("fused, rows, want", [(True, 6, True), (True, 12, False), (False, 6, False)])
+def test_the_fused_consumer_marks_the_selection_it_wrote(fused, rows, want):
+    """Slot attn_index_after_wait reads a selection before the attention's wait only
+    where the fused consumer wrote it (it fences the selection before its trigger)."""
+    p = _plugin()
+    p.topk_blocks, p.fused = 2048, fused
+    _consumer_call(p, rows, [])
+    assert p.wrote_fused(9) is want
+    assert not p.wrote_fused(7)
+    # a new forward forgets it
+    p.serves(_view(_paged()), rows, _fb())
+    assert not p.wrote_fused(9)
+
+
+def test_the_after_wait_slot_is_opt_in_and_needs_kv_before_wait(monkeypatch):
+    from sgl_nvidia_mega.deepseek_v41 import runtime
+
+    assert "attn_index_after_wait" in runtime.OPT_IN_SLOTS
+    assert "attn_index_after_wait" not in runtime.SHIPPED_SLOTS
+    monkeypatch.setattr(
+        runtime, "SLOTS", frozenset({"attn", "attn_index_after_wait"})
+    )
+    assert any("needs slot 'kv_before_wait'" in r for r in runtime.slot_reasons())
+    monkeypatch.setattr(
+        runtime,
+        "SLOTS",
+        frozenset({"attn", "kv_before_wait", "attn_index_after_wait"}),
+    )
+    assert runtime.slot_reasons() == []
+
+
+@pytest.mark.parametrize(
+    "slot, has_indexer, fused_wrote, want",
+    [
+        (True, True, False, True),  # a stock selection: after the wait
+        (True, True, True, False),  # the fused consumer's: before it, as shipped
+        (True, False, False, False),  # a reuse layer
+        (False, True, False, False),  # slot off
+    ],
+)
+def test_swapab_reads_a_stock_selection_after_its_wait(
+    slot, has_indexer, fused_wrote, want
+):
+    import importlib
+
+    step_mod = importlib.import_module("sgl_nvidia_mega.deepseek_v41.attention.step")
+
+    attn = SimpleNamespace(
+        layer_id=3,
+        compress_ratio=1,
+        indexer=object() if has_indexer else None,
+        alt_streams=None,
+    )
+    st = step_mod.AttentionStep.__new__(step_mod.AttentionStep)
+    st.attn = attn
+    st.kv_before_wait = True
+    st.index_after_wait = slot and has_indexer
+    st.fused_wo_a = False
+    st.freqs = None
+    plugin = SimpleNamespace(wrote_fused=lambda lid: fused_wrote and lid == 3)
+    st.chain = (None, SimpleNamespace(indexer=plugin))
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def sparse_decode(*a, **kw):
+        seen.update(kw)
+        raise Stop
+
+    attn.maybe_use_decode_attn_tp = lambda fb: nullcontext()
+    view = SimpleNamespace(kv_pool=SimpleNamespace(uniform_fp8=False))
+    with (
+        mock.patch.object(prepare, "low_ratio", return_value="q"),
+        mock.patch.object(st, "takes_swapab", return_value=True),
+        mock.patch.object(st, "_prepare_path", side_effect=lambda *a: prepare.low_ratio),
+        mock.patch.object(chain, "sparse_decode", side_effect=sparse_decode),
+        pytest.raises(Stop),
+    ):
+        st.run(torch.zeros(6, 4), None, None, view=view)
+    assert seen["kv_before_wait"] is True
+    assert seen["extra_after_wait"] is want

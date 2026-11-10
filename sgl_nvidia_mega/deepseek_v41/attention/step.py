@@ -156,6 +156,7 @@ class AttentionStep:
         qkv_a_bf16: bool = False,
         index_q_mxfp8_in: bool = False,
         kv_before_wait: bool = False,
+        index_after_wait: bool = False,
         swapab_h8: bool = False,
         wo_a_g1: bool = False,
     ):
@@ -163,6 +164,11 @@ class AttentionStep:
         # swap-AB gathers the KV before its PDL wait on the low-ratio prepare (slot
         # "kv_before_wait")
         self.kv_before_wait = chain_ops and kv_before_wait
+        # slot attn_index_after_wait, an indexer layer: swap-AB reads the layer's own
+        # selection after its PDL wait unless the plugin's fused consumer wrote it
+        self.index_after_wait = (
+            self.kv_before_wait and index_after_wait and attn.indexer is not None
+        )
         self.low_ratio = attn.compress_ratio in (1, 2)
         # the attention chain's query ops, padded / roped query and unroped 16 heads
         self.chain = None
@@ -266,11 +272,23 @@ class AttentionStep:
             if swapab:
                 # the attention ropes the 16-head query; no 64-head pad
                 q = path(attn, x, positions, fb, view, None, x_quant, self.chain[1])
-                # the low-ratio prepare joins its KV / index streams (full graph edges)
-                # before the query, so the attention may gather the KV before its wait
+                # the low-ratio prepare joins its KV / index streams before the query,
+                # so the attention may gather the KV before its wait. Under capture
+                # those joins are programmatic edges: a stock top-k triggers before it
+                # writes the selection, which slot attn_index_after_wait then reads
+                # after the wait (the fused consumer fences it before its trigger)
                 early = self.kv_before_wait and path is prepare.low_ratio
+                after_wait = early and self.index_after_wait
+                if after_wait and self.chain[1].indexer is not None:
+                    after_wait = not self.chain[1].indexer.wrote_fused(attn.layer_id)
                 o = chain.sparse_decode(
-                    attn, view, q, positions, self.freqs, kv_before_wait=early
+                    attn,
+                    view,
+                    q,
+                    positions,
+                    self.freqs,
+                    kv_before_wait=early,
+                    extra_after_wait=after_wait,
                 )
                 tiles = _publish_row_tiles(rows, publish)
                 return ops.wo_b(

@@ -107,9 +107,11 @@ def partial_gluon(
     ROPE_Q: gl.constexpr = False,
     KV_BEFORE_WAIT: gl.constexpr = False,
     HQ: gl.constexpr = 16,
+    EXTRA_AFTER_WAIT: gl.constexpr = False,
 ):
     gl.static_assert(SWAP_AB and H == 16 and (BT == 64 or BT == 128))
     gl.static_assert(HQ == H or HQ == 8)
+    gl.static_assert(not EXTRA_AFTER_WAIT or KV_BEFORE_WAIT)
     if USE_GDC:
         if not KV_BEFORE_WAIT:
             # tl.extra.cuda.gdc_wait + gdc_launch_dependents; every input is read after the wait.
@@ -121,15 +123,27 @@ def partial_gluon(
                 is_pure=False,
                 pack=1,
             )
-        gl.inline_asm_elementwise(
-            "griddepcontrol.launch_dependents; // $0",
-            "=r",
-            [],
-            dtype=gl.int32,
-            is_pure=False,
-            pack=1,
-        )
     b, t = gl.program_id(0), gl.program_id(1)
+    if USE_GDC:
+        if EXTRA_AFTER_WAIT:
+            if t < KT:
+                gl.inline_asm_elementwise(
+                    "griddepcontrol.launch_dependents; // $0",
+                    "=r",
+                    [],
+                    dtype=gl.int32,
+                    is_pure=False,
+                    pack=1,
+                )
+        else:
+            gl.inline_asm_elementwise(
+                "griddepcontrol.launch_dependents; // $0",
+                "=r",
+                [],
+                dtype=gl.int32,
+                is_pure=False,
+                pack=1,
+            )
     kv_layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
     n = gl.arange(0, BT, gl.SliceLayout(1, kv_layout))
     if t < KT:
@@ -149,6 +163,25 @@ def partial_gluon(
             TILE,
         )
     else:
+        if USE_GDC and EXTRA_AFTER_WAIT:
+            # the selected slots come from the PDL predecessor (the layer's top-k); the
+            # combine launches once these tiles are past it
+            gl.inline_asm_elementwise(
+                "griddepcontrol.wait; // $0",
+                "=r",
+                [],
+                dtype=gl.int32,
+                is_pure=False,
+                pack=1,
+            )
+            gl.inline_asm_elementwise(
+                "griddepcontrol.launch_dependents; // $0",
+                "=r",
+                [],
+                dtype=gl.int32,
+                is_pure=False,
+                pack=1,
+            )
         at = (t - KT) * BT + n
         length = gl.load(EL + b)
         ids = gl.load(EI + b * EIS + at, at < NE, -1)
@@ -167,8 +200,9 @@ def partial_gluon(
     qh = gl.arange(0, H, gl.SliceLayout(1, kv_layout))
     qd = gl.arange(0, 512, gl.SliceLayout(0, kv_layout))
     if USE_GDC and KV_BEFORE_WAIT:
-        # Only Q comes from the PDL predecessor; the KV rows and indices were ordered
-        # before this launch by the caller's stream joins.
+        # Only Q (and with EXTRA_AFTER_WAIT the selected slots) comes from the PDL
+        # predecessor; the caller orders the KV rows and the window indices before this
+        # launch. A second wait in the extra tiles returns at once.
         gl.inline_asm_elementwise(
             "griddepcontrol.wait; // $0",
             "=r",

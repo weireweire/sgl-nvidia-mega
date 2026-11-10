@@ -13,8 +13,10 @@ import os
 import re
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
+import requests
 from deepseek_v41_server import ARGS, ENV, MODEL, URL
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
@@ -24,7 +26,8 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS_ENV
+from sgl_nvidia_mega.deepseek_v41.attention.indexer import CHECK_ENV
+from sgl_nvidia_mega.deepseek_v41.runtime import SHIPPED_SLOTS, SLOTS_ENV
 from sgl_nvidia_mega.plugin import FLAG_CLI
 
 LAUNCH_TIMEOUT = 3600
@@ -93,6 +96,89 @@ class TestMegakernelVerify(CustomTestCase):
         scores = {p: _gsm8k(p)["accuracy"] for p in (12, 16)}
         for parallel, accuracy in scores.items():
             self.assertGreater(accuracy, GSM8K_BOUND, f"parallel {parallel}")
+
+
+# Past the indexer's candidate span: 2048 blocks of 8 compressed positions per row, at
+# compress ratio 2 about 33K tokens; the pass key sits about 47K tokens before the
+# question
+PASSKEY = "71432"
+FILLER = "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. "
+PASSKEY_PROMPT = (
+    FILLER * 300
+    + f"The pass key is {PASSKEY}. Remember it. {PASSKEY} is the pass key. "
+    + FILLER * 2400
+    + "What is the pass key? The pass key is"
+)
+# SGLANG_NVIDIA_MEGAKERNEL_E2E_INDEXER_CHECK=1: eager verify steps, each fused consumer
+# checked against SGLang's kernels (CHECK_ENV)
+INDEXER_CHECK = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_E2E_INDEXER_CHECK") == "1"
+
+
+@unittest.skipIf(URL, "launches its own server with slot attn_indexer_fused")
+class TestIndexerFusedConsumer(CustomTestCase):
+    """Slot attn_indexer_fused at batch 1 (6 verify rows): the Reindex layers' logits and
+    top-k in one launch."""
+
+    SLOTS = (*SHIPPED_SLOTS, "attn_indexer_fused")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.logs = tuple(
+            tempfile.NamedTemporaryFile("w+", suffix=s) for s in (".out", ".err")
+        )
+        env = {SLOTS_ENV: ",".join(cls.SLOTS)}
+        extra = ["--watchdog-timeout", "600"]
+        if INDEXER_CHECK:
+            env[CHECK_ENV] = "1"
+            extra.append("--disable-decode-cuda-graph")
+        cls.process = _launch(extra_env=env, extra_args=extra, log=cls.logs)
+
+    @classmethod
+    def tearDownClass(cls):
+        terminate_and_kill_process_tree(cls.process)
+        for log in cls.logs:
+            log.close()
+
+    def _log(self) -> str:
+        return "".join(Path(f.name).read_text() for f in self.logs)
+
+    def test_passkey_past_the_indexers_candidate_span(self):
+        r = requests.post(
+            DEFAULT_URL_FOR_TEST + "/generate",
+            json={
+                "text": PASSKEY_PROMPT,
+                "sampling_params": {"temperature": 0, "max_new_tokens": 16},
+            },
+            timeout=1800,
+        )
+        r.raise_for_status()
+        out = r.json()
+        prompt_tokens = out["meta_info"]["prompt_tokens"]
+        print(f"passkey: {prompt_tokens} prompt tokens -> {out['text']!r}")
+        self.assertGreater(prompt_tokens, 40000)
+        self.assertIn(PASSKEY, out["text"])
+        self.assertIn("fused consumer serves 6 rows", self._log())
+
+    def test_gsm8k_at_batch_1(self):
+        accuracy = _gsm8k(1)["accuracy"]
+        self.assertGreater(accuracy, GSM8K_BOUND)
+        log = self._log()
+        self.assertIn("fused consumer serves 6 rows", log)
+        if INDEXER_CHECK:
+            checks = re.findall(r"indexer check: (\d+) of (\d+) layer selections", log)
+            self.assertTrue(checks, "no indexer check ran")
+            self.assertEqual(checks[-1][0], "0", f"selections differ: {checks[-1]}")
+
+
+@unittest.skipIf(URL, "launches its own server with slot attn_index_after_wait")
+class TestIndexSelectionAfterWait(TestIndexerFusedConsumer):
+    """Slot attn_index_after_wait with the fused consumer: the attention of the indexer
+    layers reads a stock top-k's selection after its PDL wait."""
+
+    SLOTS = (*SHIPPED_SLOTS, "attn_indexer_fused", "attn_index_after_wait")
+
+    def test_the_slot_is_built(self):
+        self.assertIn("a stock selection after the wait", self._log())
 
 
 if __name__ == "__main__":

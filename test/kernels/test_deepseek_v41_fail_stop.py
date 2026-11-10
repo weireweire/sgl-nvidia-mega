@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Fail-stop waits on 4 SM100-family GPUs (GB300): when one rank never joins, the ranks
 that wait on it fault within their deadline instead of hanging: the Lamport consumer of
-the wo_b publish (1-8 rows) and the two-shot hop (49-384 rows), whose deadline comes
-from its build alone.
+the wo_b publish (1-8 rows), also with its RMSNorm sums on mbarriers (slot hop_mbar), and
+the two-shot hop (49-384 rows), whose deadline comes from its build alone.
 
 Each case runs its own torchrun, since a faulted rank leaves its CUDA context unusable.
 Run with ``python test/kernels/test_deepseek_v41_fail_stop.py``.
@@ -39,11 +39,11 @@ HOP_FAULT_WORKER = textwrap.dedent(
     tp = ps.get_tp_group()
     dev = torch.device("cuda", torch.cuda.current_device())
     H, HC = 5120, 4
-    if case == "lamport":
+    if case in ("lamport", "lamport_mbar"):
         from sgl_nvidia_mega.deepseek_v41.sm103 import all_reduce_mhc as m
         m.set_wait_deadline(deadline)
         hop = m.AllReduceMHC(hidden_size=H, hc_mult=HC, max_num_tokens=16, top_k=6, device=dev,
-                             group=tp.device_group)
+                             group=tp.device_group, mbarrier_exchange=case == "lamport_mbar")
         rows = 6
         def run():
             x = torch.randn(rows, H, device=dev).bfloat16()
@@ -88,7 +88,7 @@ def _gpu4() -> bool:
 
 
 @pytest.mark.skipif(not _gpu4(), reason="needs 4 SM100-family GPUs")
-@pytest.mark.parametrize("case", ["lamport", "two_shot"])
+@pytest.mark.parametrize("case", ["lamport", "lamport_mbar", "two_shot"])
 def test_a_missing_rank_faults_its_hop_peers_in_time(case, tmp_path):
     script = tmp_path / "worker.py"
     script.write_text(HOP_FAULT_WORKER)

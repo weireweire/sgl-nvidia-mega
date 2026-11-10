@@ -205,8 +205,11 @@ class MegakernelDecode:
                 if hasattr(st.fb, attr):
                     delattr(st.fb, attr)
             residual, pre = self._layers(st, x)
+            collapsed = boundary.final_collapse(st)
         finally:
             boundary.clear(st)
+        if collapsed is not None:
+            return boundary.head(st, residual, collapsed)
         return logits.head(st, residual, pre)
 
     def _layers(self, st, x):

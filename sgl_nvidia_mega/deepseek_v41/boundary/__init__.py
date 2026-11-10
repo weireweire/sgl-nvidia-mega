@@ -65,6 +65,8 @@ def build(model, ctx, group) -> Boundaries:
             hop_b_wide="hop_b_wide" in runtime.SLOTS,
             hop_b_cap16="hop_b_cap16" in runtime.SLOTS,
             hop_b_quad_trigger="hop_b_quad_trigger" in runtime.SLOTS,
+            mbarrier_exchange="hop_mbar" in runtime.SLOTS,
+            final_collapse="hop_final_collapse" in runtime.SLOTS,
         )
     two_shot, two_shot_reason = None, "stock (slot off)"
     if "two_shot" in runtime.SLOTS:
@@ -79,6 +81,7 @@ def build(model, ctx, group) -> Boundaries:
         two_shot_reason=two_shot_reason,
         hop_b="hop_b" in runtime.SLOTS,
         prenorm=use_prenorm,
+        final_collapse="hop_final_collapse" in runtime.SLOTS,
     )
 
 
@@ -176,6 +179,18 @@ def final(st):
     st.bound["boundary"].join_aux(bs)
     state = bs.hc.materialized(m.layers[m.end_layer - 1].hc_cfg)
     return state.residual, state.pre
+
+
+def final_collapse(st):
+    """The head's mHC collapse the last layer's hop B wrote (slot hop_final_collapse),
+    or None: the head then combines the final streams itself."""
+    return _state(st).final_collapse
+
+
+def head(st, residual, collapsed):
+    """``logits.head`` on the collapse hop B wrote: (hidden, pre_hc_head), SGLang's
+    final RMSNorm on the same BF16 rows its mhc_combine would give."""
+    return st.model.norm(collapsed), residual.flatten(1)
 
 
 def clear(st) -> None:

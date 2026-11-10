@@ -32,7 +32,9 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import make_fake_compact_tensor
+from cutlass.cutlass_dsl import T, dsl_user_op
 from flashinfer.cute_dsl.fp4_common import get_ptr_as_int64, st_global_u64
 from flashinfer.quantization.quantization_cute_dsl_utils import (
     INV_FLOAT8_E4M3_MAX,
@@ -111,6 +113,79 @@ SCALE_TILE_ROWS = 128
 SCALE_TILE_COLS = 4
 # The row-tile layout (mxfp8_ll, past 8 rows): every 8-row tile owns a 128-row atom
 ROW_TILE_ROWS = 8
+
+
+def _asm(result, operands, text, constraints, *, loc, ip):
+    return llvm.inline_asm(
+        result,
+        operands,
+        text,
+        constraints,
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _st_async_peer_f32(
+    slot: cute.Pointer,
+    value: Float32,
+    barrier: cute.Pointer,
+    peer: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """``value`` into ``slot`` of cluster CTA ``peer``, completing 4 bytes on that
+    CTA's ``barrier`` (both given as this CTA's own shared addresses)."""
+    _asm(
+        None,
+        [
+            slot.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            value.ir_value(loc=loc, ip=ip),
+            barrier.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            peer.ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .b32 dst, bar; mapa.shared::cluster.u32 dst, $0, $3; "
+        "mapa.shared::cluster.u32 bar, $2, $3; "
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [dst], $1, [bar]; }",
+        "r,f,r,r,~{memory}",
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _mbarrier_try_wait_cluster(barrier: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    """1 once phase 0 of ``barrier`` completed (acquire at cluster scope), else 0."""
+    return Int32(
+        _asm(
+            T.i32(),
+            [barrier.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)],
+            "{ .reg .pred p; mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 "
+            "p, [$1], 0; selp.u32 $0, 1, 0, p; }",
+            "=r,r,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def _fma_f32(a: Float32, b: Float32, c: Float32, *, loc=None, ip=None) -> Float32:
+    return Float32(
+        _asm(
+            T.f32(),
+            [x.ir_value(loc=loc, ip=ip) for x in (a, b, c)],
+            "fma.rn.f32 $0, $1, $2, $3;",
+            "=f,f,f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @cute.jit
@@ -617,6 +692,8 @@ class _LamportMHCDeviceKernel:
         deadline_ns: int = 0,
         early_trigger: bool | str = False,
         row_tile_scales: bool = False,
+        mbarrier_exchange: bool = False,
+        collapse_only: bool = False,
     ) -> None:
         if rank_lanes not in (1, 2, 4, 8):
             raise ValueError("rank_lanes must be 1, 2, 4, or 8")
@@ -631,6 +708,12 @@ class _LamportMHCDeviceKernel:
             raise ValueError("MXFP8 output needs rank_lanes == 1 and hidden % 128 == 0")
         if quantize and residual_only:
             raise ValueError("a residual-only consumer has no layer input to quantize")
+        if collapse_only and (quantize or residual_only):
+            raise ValueError("a collapse-only consumer writes the BF16 collapse alone")
+        # the head's mHC collapse as SGLang's mhc_combine computes it (one FMA chain over
+        # the streams, from 0), written instead of the normalized layer input
+        self.collapse_only = collapse_only
+        self.normalize = not residual_only and not collapse_only
         self.quantize = quantize
         # the MXFP8 output's scales per 8-row tile (the wide low-latency GEMM's input)
         self.row_tile_scales = quantize and row_tile_scales
@@ -653,8 +736,13 @@ class _LamportMHCDeviceKernel:
         self.deadline_ns = deadline_ns
         # where dependents may launch: "end" (after the epilogue), "poll" or "start"
         self.trigger_at = {False: "end", True: "poll", "start": "start"}[early_trigger]
+        # the CTA sums of the RMSNorm cross the cluster by st.async onto an mbarrier of
+        # each CTA instead of DSMEM stores and a cluster barrier (same values, same order)
+        self.mbarrier_exchange = mbarrier_exchange and self.normalize
 
     def smem_size_in_bytes(self) -> int:
+        if self.mbarrier_exchange:
+            return 8 + (self.warps + self.cluster_size) * 4
         return (self.warps + self.cluster_size) * 4
 
     @cute.jit
@@ -724,6 +812,19 @@ class _LamportMHCDeviceKernel:
         # for this whole grid, and the launch needs every CTA of it to have triggered.
         if cutlass.const_expr(self.enable_pdl and self.trigger_at == "start"):
             cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(self.mbarrier_exchange):
+            smem = cutlass.utils.SmemAllocator()
+            exchange_barrier = smem.allocate_array(Int64, 1)
+            warp_sums = smem.allocate_array(Float32, self.warps)
+            cluster_sums = smem.allocate_array(Float32, self.cluster_size)
+            if tidx == 0:
+                cute.arch.mbarrier_init(exchange_barrier, 1)
+                cute.arch.mbarrier_init_fence()
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    exchange_barrier, self.cluster_size * 4
+                )
+            # peers may st.async into this CTA once every CTA passed this arrive
+            cute.arch.cluster_arrive_relaxed()
 
         prenorm_fragments = cute.make_rmem_tensor(
             cute.make_layout(
@@ -754,7 +855,7 @@ class _LamportMHCDeviceKernel:
             fragment = base_fragment + trip * self.fragment_stride
             if fragment < self.fragments and rank_lane == 0:
                 gamma_element = Int64(fragment) * VEC_BF16
-                if cutlass.const_expr(self.write_layer_input):
+                if cutlass.const_expr(self.normalize):
                     gamma_pointer = cute.make_ptr(
                         BFloat16,
                         (gamma.iterator + gamma_element).llvm_ptr,
@@ -892,12 +993,34 @@ class _LamportMHCDeviceKernel:
                         Int64((residual_output.iterator + output_element).toint()),
                         bf16x8_to_packed_u32x4(mixed_bf16),
                     )
-                    if cutlass.const_expr(self.write_layer_input):
+                    if cutlass.const_expr(self.collapse_only):
+                        streams = cute.make_rmem_tensor(
+                            cute.make_layout((VEC_BF16,)), Float32
+                        )
+                        streams.store(mixed_bf16.to(Float32))
+                        for element in cutlass.range_constexpr(VEC_BF16):
+                            collapse[element] = _fma_f32(
+                                pre_mix[target], streams[element], collapse[element]
+                            )
+                    elif cutlass.const_expr(self.write_layer_input):
                         collapse.store(
                             collapse.load() + mixed_bf16.to(Float32) * pre_mix[target]
                         )
                 if cutlass.const_expr(self.write_layer_input):
                     prenorm_fragments[trip, None].store(collapse.load().to(BFloat16))
+                if cutlass.const_expr(self.collapse_only):
+                    store_global_u32x4(
+                        Int64(
+                            (
+                                norm_output.iterator
+                                + (
+                                    Int64(token) * self.hidden
+                                    + Int64(fragment) * VEC_BF16
+                                )
+                            ).toint()
+                        ),
+                        bf16x8_to_packed_u32x4(prenorm_fragments[trip, None].load()),
+                    )
 
         if token == 0 and cluster_rank == 0 and tidx == 0:
             store_global_u32(
@@ -921,7 +1044,7 @@ class _LamportMHCDeviceKernel:
                         Int64((contribution_mailbox.iterator + source_element).toint())
                     )
 
-        if cutlass.const_expr(self.write_layer_input):
+        if cutlass.const_expr(self.normalize):
             thread_sum = Float32(0.0)
             for trip in cutlass.range_constexpr(self.trips):
                 fragment = base_fragment + trip * self.fragment_stride
@@ -933,21 +1056,45 @@ class _LamportMHCDeviceKernel:
                         reduction_profile=0,
                     )
 
-            smem = cutlass.utils.SmemAllocator()
-            warp_sums = smem.allocate_array(Float32, self.warps)
-            cluster_sums = smem.allocate_array(Float32, self.cluster_size)
+            if cutlass.const_expr(not self.mbarrier_exchange):
+                smem = cutlass.utils.SmemAllocator()
+                warp_sums = smem.allocate_array(Float32, self.warps)
+                cluster_sums = smem.allocate_array(Float32, self.cluster_size)
             cta_sum = _group_leader_block_sum(
                 thread_sum,
                 warp_sums,
                 self.warps,
                 self.rank_lanes,
             )
-            if tidx < self.cluster_size:
-                local_slot = cluster_sums + cluster_rank
-                remote_slot = map_shared_to_peer(local_slot, Int32(tidx))
-                store_shared_cluster_f32(remote_slot, cta_sum)
-            cute.arch.cluster_arrive()
-            cute.arch.cluster_wait()
+            if cutlass.const_expr(self.mbarrier_exchange):
+                cute.arch.cluster_wait()
+                if tidx < self.cluster_size:
+                    _st_async_peer_f32(
+                        cluster_sums + cluster_rank,
+                        cta_sum,
+                        exchange_barrier,
+                        Int32(tidx),
+                    )
+                received = _mbarrier_try_wait_cluster(exchange_barrier)
+                polls = Int32(0)
+                started = Int64(0)
+                while received == Int32(0):
+                    if cutlass.const_expr(self.deadline_ns > 0):
+                        polls = polls + 1
+                        if polls % _DEADLINE_POLLS == 0:
+                            now = global_timer_ns()
+                            if started == Int64(0):
+                                started = now
+                            if now - started > Int64(self.deadline_ns):
+                                fault_at_null()
+                    received = _mbarrier_try_wait_cluster(exchange_barrier)
+            else:
+                if tidx < self.cluster_size:
+                    local_slot = cluster_sums + cluster_rank
+                    remote_slot = map_shared_to_peer(local_slot, Int32(tidx))
+                    store_shared_cluster_f32(remote_slot, cta_sum)
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
             full_sum = Float32(0.0)
             for peer in cutlass.range_constexpr(self.cluster_size):
                 full_sum = full_sum + cute.arch.load(
@@ -1059,6 +1206,10 @@ class AllReduceMHC:
     ``early_trigger``, the consumer lets the next kernel launch right after its
     poll instead of after its epilogue. With ``hop_b_start_trigger``, the quantized
     and residual-only consumers (the MoE post's) let it launch at their start.
+    With ``mbarrier_exchange``, the consumers' RMSNorm sums cross the cluster by
+    st.async onto mbarriers instead of a cluster barrier (bitwise). With
+    ``final_collapse``, ``finalize(..., collapse=True)`` also writes the streams'
+    collapse as the model head's ``mhc_combine`` does, for the last layer.
     """
 
     def __init__(
@@ -1076,6 +1227,8 @@ class AllReduceMHC:
         hop_b_start_trigger: bool = False,
         row_tile_layer_input: bool = False,
         publish_trigger_max_rows: int = 0,
+        mbarrier_exchange: bool = False,
+        final_collapse: bool = False,
     ) -> None:
         self.hidden_size = hidden = hidden_size
         self.hc_mult = hc = hc_mult
@@ -1168,7 +1321,10 @@ class AllReduceMHC:
             self._no_quant_args = (no_quant_cute, no_quant_cute)
 
             def compile_collective(
-                quantize: bool, residual_only: bool = False, row_tiles: bool = False
+                quantize: bool,
+                residual_only: bool = False,
+                row_tiles: bool = False,
+                collapse_only: bool = False,
             ):
                 if quantize:
                     quant_fakes = (
@@ -1202,6 +1358,8 @@ class AllReduceMHC:
                             else early_trigger
                         ),
                         row_tile_scales=row_tiles,
+                        mbarrier_exchange=mbarrier_exchange,
+                        collapse_only=collapse_only,
                     ),
                     make_fake_compact_tensor(
                         BFloat16,
@@ -1247,6 +1405,11 @@ class AllReduceMHC:
             self._collective_residual = (
                 compile_collective(quantize=False, residual_only=True)
                 if residual_only
+                else None
+            )
+            self._collective_collapse = (
+                compile_collective(quantize=False, collapse_only=True)
+                if final_collapse
                 else None
             )
             # Stand-in for the norm weight the residual-only variant never reads.
@@ -1331,6 +1494,7 @@ class AllReduceMHC:
         norm_weight: torch.Tensor | None,
         norm_eps: float,
         mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+        collapse: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """``__call__`` for a MoE output left unfinalized.
 
@@ -1349,6 +1513,10 @@ class AllReduceMHC:
             norm_weight: [hidden] BF16 RMSNorm weight (None with ``pre``).
             norm_eps: RMSNorm epsilon.
             mxfp8_out: as in ``__call__``.
+            collapse: with ``pre`` and no ``norm_weight`` (built with
+                ``final_collapse``): the second output is the [M, hidden] BF16
+                collapse ``sum_k pre[k] * streams[k]``, bitwise SGLang's
+                ``mhc_combine`` of the streams, not normalized.
 
         """
         if self._published is not None:
@@ -1384,6 +1552,8 @@ class AllReduceMHC:
             Int32(m),
             current_cu_stream(),
         )
+        if collapse:
+            return self._collect_collapse(residual, post, comb, pre, m)
         return self._collect(
             residual, post, comb, pre, norm_weight, norm_eps, m, mxfp8_out
         )
@@ -1422,6 +1592,32 @@ class AllReduceMHC:
             or comb.numel() != m * hc * hc
         ):
             raise ValueError("unexpected mix shapes")
+
+    def _collect_collapse(self, residual, post, comb, pre, m):
+        """(post-mixed streams, their BF16 collapse with ``pre``)."""
+        if self._collective_collapse is None:
+            raise ValueError("built without final_collapse")
+        if pre is None:
+            raise ValueError("the collapse needs the pre-mix")
+        hidden, hc = self.hidden_size, self.hc_mult
+        residual_output = torch.empty_like(residual)
+        collapsed = torch.empty((m, hidden), dtype=torch.bfloat16, device=pre.device)
+        self._collective_collapse(
+            to_cute(self._mailbox.flatten(), 16),
+            to_cute_dynamic(residual.flatten(), 16, divisibility=hc * hidden),
+            to_cute_dynamic(post.flatten(), 4, divisibility=hc),
+            to_cute_dynamic(comb.flatten(), 4, divisibility=hc * hc),
+            to_cute_dynamic(pre.flatten(), 4, divisibility=hc),
+            to_cute(self._no_norm_weight, 16),
+            to_cute_dynamic(residual_output.flatten(), 16, divisibility=hc * hidden),
+            to_cute_dynamic(collapsed.flatten(), 16, divisibility=hidden),
+            *self._no_quant_args,
+            to_cute(self._stage_state, 4),
+            Float32(0.0),
+            Int32(m),
+            current_cu_stream(),
+        )
+        return residual_output, collapsed
 
     def _collect(
         self,

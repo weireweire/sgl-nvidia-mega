@@ -38,10 +38,12 @@ class HopA:
             partial, residual, post_mix, comb, pre, norm_weight, eps
         )
 
-    def finalize(self, *args, rows: int, mxfp8_out=None):
+    def finalize(self, *args, rows: int, mxfp8_out=None, collapse: bool = False):
         """Hop B: ``AllReduceMHC.finalize`` of a deferred MoE output of ``rows`` rows, on
         the hop A mailbox or, past its capacity, slot hop_b_wide's."""
-        return self._runner.hop_for(rows).finalize(*args, mxfp8_out=mxfp8_out)
+        return self._runner.hop_for(rows).finalize(
+            *args, mxfp8_out=mxfp8_out, collapse=collapse
+        )
 
     def check_consumed(self) -> None:
         """Raise on the host if a publish was not collected: it would leave the
@@ -61,13 +63,17 @@ def build(
     hop_b_wide: bool = False,
     hop_b_cap16: bool = False,
     hop_b_quad_trigger: bool = False,
+    mbarrier_exchange: bool = False,
+    final_collapse: bool = False,
 ) -> tuple[Optional[HopA], str]:
     """(the hop, "") or (None, why not). Collective over the TP group: a failure on
     any rank raises on every rank; an unsupported wo_b leaves the hop off. ``hop_b``
     also compiles the MoE finalize's consumers; ``early_trigger`` launches the
     consumer's dependents right after its poll, ``hop_b_start_trigger`` the MoE
     finalize's at its start; ``batch2`` (slot hop_a_batch2) adds 9-16 rows; ``hop_b_wide``
-    runs hop B at every width up to plan.HOP_B_MAX_ROWS, not only hop A's."""
+    runs hop B at every width up to plan.HOP_B_MAX_ROWS, not only hop A's;
+    ``mbarrier_exchange`` (slot hop_mbar) and ``final_collapse`` (slot
+    hop_final_collapse, with ``hop_b``) are AllReduceMHC's, on every mailbox."""
     from sgl_nvidia_mega.deepseek_v41.sm103.runner import Runner
 
     m = model.model
@@ -103,6 +109,8 @@ def build(
             publish_trigger_max_rows=(
                 slot_plan.HOP_A_BATCH1_ROWS if hop_b_quad_trigger else 0
             ),
+            mbarrier_exchange=mbarrier_exchange,
+            final_collapse=hop_b and final_collapse,
         )
         taken = tuple(runner.precompile_publish(wo_b, list(rows)))
         if hop_b and hop_b_quad_trigger:

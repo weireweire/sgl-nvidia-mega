@@ -99,7 +99,10 @@ DRAFT_SLOTS = frozenset(
 # swapab_h8 / wo_a_g1: at attention TP8, swap-AB on the 8 local heads and the fused wo_a
 # on the 1 local group, target and draft, in place of SGLang's FlashMLA and einsum, which
 # TP8 runs (each bitwise to its TP4 kernel on the same heads / group, not to SGLang's
-# TP8 arm); no effect at TP4)
+# TP8 arm); no effect at TP4;
+# hop_mbar: the Lamport consumers' RMSNorm sums cross the cluster by st.async onto
+# mbarriers, not a cluster barrier, bitwise; hop_final_collapse: the last layer's hop B
+# also writes the head's mHC collapse, so the head runs only its RMSNorm, bitwise)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -108,6 +111,8 @@ OPT_IN_SLOTS = (
     "lm_head_pinned_tactic",
     "swapab_h8",
     "wo_a_g1",
+    "hop_mbar",
+    "hop_final_collapse",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -162,6 +167,8 @@ def slot_reasons() -> list[str]:
         ("hop_b_wide", "attn_qkv_a"),
         ("hop_b_cap16", "hop_b_wide"),
         ("hop_b_quad_trigger", "hop_b"),
+        ("hop_mbar", "hop_a"),
+        ("hop_final_collapse", "hop_b"),
         ("draft_lm_head", "markov"),
         ("kv_before_wait", "attn"),
         ("draft_moe", "draft"),
@@ -354,6 +361,8 @@ def build(model, ctx):
         "hop_b_cap16": bound["boundary"].hop_b
         and all(w in hop.rows for w in hop.hop_b_rows),
         "hop_b_quad_trigger": bound["boundary"].hop_b,
+        "hop_mbar": facts.hop_a,
+        "hop_final_collapse": bound["boundary"].final_collapse,
         # step-head work that needs no build: on when requested
         "sched_ahead": "sched_ahead" in SLOTS,
         # swap-AB serves 1-24 rows on low-ratio layers: built when a covered width is
@@ -386,9 +395,7 @@ def build(model, ctx):
         else {"kv_before_wait"}
     )
     # every package's build agrees across ranks, so this raises on every rank alike
-    missing = sorted(
-        name for name in (SLOTS & built.keys()) - moot if not built[name]
-    )
+    missing = sorted(name for name in (SLOTS & built.keys()) - moot if not built[name])
     if missing:
         raise RuntimeError(
             f"NVIDIA megakernel: requested slots {missing} built at no width "

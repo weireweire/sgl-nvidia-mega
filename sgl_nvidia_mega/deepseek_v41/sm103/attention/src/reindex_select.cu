@@ -31,7 +31,10 @@
 //
 // PDL: the keys and their scales are read after the grid-dependency wait. With
 // `inputs_before_wait`, the published blocks, lengths, query and weights are read
-// before it (the caller's contract: no kernel this one may overlap writes them).
+// before it (the caller's contract: no kernel this one may overlap writes them). With
+// `trigger_after_write`, the dependents launch once the selection is written and fenced,
+// so one that reads it before its own wait sees it (in a captured graph a stream join is
+// a programmatic edge too); without, they launch just before it is written.
 //
 // Variant macros: RS_CLUSTER (CTAs per row), RS_TILES (tiles per CTA) and
 // RS_SMEM_BYTES (the launcher's dynamic shared memory).
@@ -339,7 +342,8 @@ extern "C" __global__ __launch_bounds__(kThreads, 1) void dsv41_reindex_select(
     int32_t page_tokens, int32_t page_shift, const uint8_t* __restrict__ q, const uint32_t* __restrict__ q_sf,
     const void* __restrict__ weights, int32_t weights_bf16, const int32_t* __restrict__ blocks,
     int64_t blocks_stride, const int32_t* __restrict__ valid_lens, int32_t* __restrict__ out, int64_t out_stride,
-    int32_t topk, uint16_t* __restrict__ logits_out, int64_t logits_stride, int32_t inputs_before_wait) {
+    int32_t topk, uint16_t* __restrict__ logits_out, int64_t logits_stride, int32_t inputs_before_wait,
+    int32_t trigger_after_write) {
   extern __shared__ __align__(1024) uint8_t smem_raw[];
   Smem& s = *reinterpret_cast<Smem*>(smem_raw);
   const uint32_t tid = threadIdx.x, warp = tid / 32, lane = tid % 32;
@@ -712,12 +716,17 @@ extern "C" __global__ __launch_bounds__(kThreads, 1) void dsv41_reindex_select(
       ++eq_rank;
     }
   }
-  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  if (!trigger_after_write) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 #pragma unroll
   for (uint32_t i = 0; i < kPerThread; ++i) {
     if (take_bits >> i & 1u) {
       const uint32_t local = first + i;
       row_out[pos++] = (s.blocks[local / kBlockKeys] << 3) | static_cast<int32_t>(local & 7);
     }
+  }
+  if (trigger_after_write) {
+    // a dependent that reads the selection before its own wait sees it
+    __threadfence();
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   }
 }

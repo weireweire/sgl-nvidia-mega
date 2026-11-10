@@ -119,12 +119,14 @@ class TestIndexerFusedConsumer(CustomTestCase):
     """Slot attn_indexer_fused at batch 1 (6 verify rows): the Reindex layers' logits and
     top-k in one launch."""
 
+    SLOTS = (*SHIPPED_SLOTS, "attn_indexer_fused")
+
     @classmethod
     def setUpClass(cls):
         cls.logs = tuple(
             tempfile.NamedTemporaryFile("w+", suffix=s) for s in (".out", ".err")
         )
-        env = {SLOTS_ENV: ",".join((*SHIPPED_SLOTS, "attn_indexer_fused"))}
+        env = {SLOTS_ENV: ",".join(cls.SLOTS)}
         extra = ["--watchdog-timeout", "600"]
         if INDEXER_CHECK:
             env[CHECK_ENV] = "1"
@@ -166,6 +168,17 @@ class TestIndexerFusedConsumer(CustomTestCase):
             checks = re.findall(r"indexer check: (\d+) of (\d+) layer selections", log)
             self.assertTrue(checks, "no indexer check ran")
             self.assertEqual(checks[-1][0], "0", f"selections differ: {checks[-1]}")
+
+
+@unittest.skipIf(URL, "launches its own server with slot attn_index_after_wait")
+class TestIndexSelectionAfterWait(TestIndexerFusedConsumer):
+    """Slot attn_index_after_wait with the fused consumer: the attention of the indexer
+    layers reads a stock top-k's selection after its PDL wait."""
+
+    SLOTS = (*SHIPPED_SLOTS, "attn_indexer_fused", "attn_index_after_wait")
+
+    def test_the_slot_is_built(self):
+        self.assertIn("a stock selection after the wait", self._log())
 
 
 if __name__ == "__main__":

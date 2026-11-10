@@ -116,7 +116,10 @@ DRAFT_SLOTS = frozenset(
 # prologue_fork: the Engram hashes forked at the step start and the embedding written
 # into the streams, bitwise; engram_side_ar: the Engram prefetch's two all-reduces on
 # its own stream, joined at the first Engram gate, bitwise; hc_coeff_fused: the
-# prenorm's mHC coefficients in one launch, bitwise with hc_prenorm's two)
+# prenorm's mHC coefficients in one launch, bitwise with hc_prenorm's two;
+# attn_index_after_wait: on the indexer layers, swap-AB reads a stock top-k's selection
+# only after its PDL wait (a captured stream join is a programmatic edge and the stock
+# top-k triggers before it writes; bitwise)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -137,6 +140,7 @@ OPT_IN_SLOTS = (
     "prologue_fork",
     "engram_side_ar",
     "hc_coeff_fused",
+    "attn_index_after_wait",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -222,6 +226,7 @@ def slot_reasons() -> list[str]:
         ("engram_side_ar", "engram"),
         ("engram_side_ar", "prologue_fork"),
         ("hc_coeff_fused", "hc_prenorm"),
+        ("attn_index_after_wait", "kv_before_wait"),
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
@@ -443,6 +448,9 @@ def build(model, ctx):
             and a.chain[0].indexer is not None
             and a.chain[0].indexer.fused
             for a in bound["attention"].values()
+        ),
+        "attn_index_after_wait": any(
+            a.index_after_wait and a.swapab for a in bound["attention"].values()
         ),
         # the indexer wq_b on the chain's q_lora quant: indexer layers, 1-8 rows
         "index_q_mxfp8_in": any(w <= 8 for w in pctx.widths)

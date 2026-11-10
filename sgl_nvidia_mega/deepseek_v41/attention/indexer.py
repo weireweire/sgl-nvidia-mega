@@ -182,6 +182,9 @@ class StepIndexer:
             reindex_select.precompile(torch.cuda.current_device())
         self._fused_logged: set[int] = set()
         self._fused_now = False  # the last consumer ran the fused kernel
+        self._fused_layer = (
+            None  # the layer whose selection the fused kernel wrote last
+        )
         self._served_rows: set[int] = set()
         self._declined: dict[tuple, int] = {}
         self.compared = self.differ = 0
@@ -196,7 +199,7 @@ class StepIndexer:
         once per forward, so a consumer never reads the other path's table."""
         meta = view.metadata
         if meta is not self._meta:
-            self._meta, self._table = meta, None
+            self._meta, self._table, self._fused_layer = meta, None, None
             paged = [
                 m
                 for m in (
@@ -277,6 +280,7 @@ class StepIndexer:
             self._fused_now = self.fused_takes(data, k_cache, out)
             if self._fused_now:
                 self._consume_fused(data, k_cache, self._table, out)
+                self._fused_layer = attn.layer_id
                 if self.check and not torch.cuda.is_current_stream_capturing():
                     self._check_fused(data, k_cache, self._table, out)
             else:
@@ -373,6 +377,11 @@ class StepIndexer:
             ready.record(self.stream)
         return Table(blocks, schedule, phys_blocks, valid_lens, ready)
 
+    def wrote_fused(self, layer_id: int) -> bool:
+        """Whether this forward's selection of ``layer_id`` came from the fused consumer,
+        which writes it before it lets its dependents launch."""
+        return self._fused_layer == layer_id
+
     def fused_takes(self, data: Query, k_cache, out) -> bool:
         """Whether slot attn_indexer_fused runs this consumer call (shapes known at
         capture, the same on every rank)."""
@@ -407,7 +416,9 @@ class StepIndexer:
     def _consume_fused(data: Query, k_cache, table: Table, out, logits=None) -> None:
         torch.cuda.current_stream().wait_event(table.ready)
         # the query (stream 1) and the table (the source's stream) join this stream by
-        # events, full dependencies: the kernel reads them before its PDL wait
+        # events, which a captured graph turns into programmatic edges: the kernel reads
+        # them before its PDL wait because their writers finished layers earlier (the
+        # table) or end at their exit (the query's RoPE + pack, which never triggers)
         reindex_select.reindex_select(
             data.q_fp4,
             data.q_sf,

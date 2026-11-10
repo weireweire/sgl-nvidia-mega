@@ -241,6 +241,86 @@ __device__ __forceinline__ void Router2(const unsigned short* __restrict__ x, co
   DSV41_STAMP(3);
 }
 
+// Router replica 3: Router2's arithmetic, its weight words staged before the grid-dependency
+// wait. kMode 1: each thread cp.async's its own 32-byte words into shared memory (an async
+// copy keeps its place above the wait; ptxas sinks plain register loads below it) and
+// reads them back after the wait; kMode 2: an L2 prefetch of the CTA's rows before the
+// wait, the register loads after it.
+template <int kSplitN, int kMode>
+__device__ __forceinline__ void Router3(const unsigned short* __restrict__ x, const unsigned short* __restrict__ w,
+                                        float* __restrict__ logits, int rows, int trigger_at_entry) {
+  if (trigger_at_entry) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  DSV41_STAMP(0);
+  const int tx = threadIdx.x, bx = blockIdx.x, warp = tx / 32;
+  __shared__ __align__(16) uint4 stage[kSplitN][2][kThreads];
+  if constexpr (kMode == 1) {
+#pragma unroll
+    for (int n = 0; n < kSplitN; ++n) {
+      const unsigned short* src = w + (long long)(bx * kSplitN + n) * kHidden + tx * kChunk;
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const unsigned int dst = static_cast<unsigned int>(__cvta_generic_to_shared(&stage[n][h][tx]));
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(dst), "l"(src + 8 * h) : "memory");
+      }
+    }
+    asm volatile("cp.async.commit_group;" ::: "memory");
+  } else {
+    const char* rows_base = reinterpret_cast<const char*>(w + (long long)(bx * kSplitN) * kHidden);
+    for (int line = tx; line < kSplitN * kHidden * 2 / 128; line += kThreads)
+      asm volatile("prefetch.global.L2::evict_last [%0];" ::"l"(rows_base + line * 128));
+  }
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  DSV41_STAMP(1);
+  Chunk xv[8];
+#pragma unroll
+  for (int m = 0; m < 8; ++m) if (m < rows) xv[m] = LoadChunk(x + m * kHidden + tx * kChunk);
+  Chunk wv[kSplitN];
+  if constexpr (kMode == 1) {
+    asm volatile("cp.async.wait_all;" ::: "memory");
+#pragma unroll
+    for (int n = 0; n < kSplitN; ++n) {
+      const uint4 lo = stage[n][0][tx], hi = stage[n][1][tx];
+      wv[n] = {{lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w}};
+    }
+  } else {
+#pragma unroll
+    for (int n = 0; n < kSplitN; ++n) wv[n] = LoadChunk(w + (long long)(bx * kSplitN + n) * kHidden + tx * kChunk);
+  }
+  __shared__ float s_acc[kWarps][8 * kSplitN];
+#pragma unroll
+  for (int m = 0; m < 8; ++m) {
+    if (m < rows) {
+#pragma unroll
+      for (int n = 0; n < kSplitN; ++n) {
+        const float sum = WarpSum(Dot(xv[m], wv[n]));
+        if ((tx & 31) == 0) s_acc[warp][m * kSplitN + n] = sum;
+      }
+    }
+  }
+  DSV41_STAMP(2);
+  if (!trigger_at_entry) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  __syncthreads();
+  if (tx < rows * kSplitN) {
+    float acc = s_acc[0][tx];
+#pragma unroll
+    for (int i = 1; i < kWarps; ++i) acc = AddRn(acc, s_acc[i][tx]);
+    logits[(tx / kSplitN) * kExperts + bx * kSplitN + tx % kSplitN] = acc;
+  }
+  DSV41_STAMP(3);
+}
+
+#define N3_ROUTER3(name, split, mode)                                                                       \
+  extern "C" __global__ __launch_bounds__(320) void name(                                                    \
+      const unsigned short* __restrict__ x, const unsigned short* __restrict__ w, float* __restrict__ logits, \
+      int rows, int trigger_at_entry, unsigned long long* stamps) {                                          \
+    N3_BEGIN(stamps);                                                                                        \
+    Router3<split, mode>(x, w, logits, rows, trigger_at_entry);                                              \
+  }
+N3_ROUTER3(n3_router3_s3_cp, 3, 1)
+N3_ROUTER3(n3_router3_s1_cp, 1, 1)
+N3_ROUTER3(n3_router3_s3_pf, 3, 2)
+N3_ROUTER3(n3_router3_s1_pf, 1, 2)
+
 extern "C" __global__ __launch_bounds__(320) void n3_router2_s3(
     const unsigned short* __restrict__ x, const unsigned short* __restrict__ w, float* __restrict__ logits,
     int rows, int trigger_at_entry, unsigned long long* stamps) {
@@ -285,6 +365,11 @@ def _load(device_index):
         "router": jit.load(misc, "n3_router", (320, 1, 1), 0),
         "router2_s3": jit.load(misc, "n3_router2_s3", (320, 1, 1), 0),
         "router2_s1": jit.load(misc, "n3_router2_s1", (320, 1, 1), 0),
+        **{
+            f"router3_s{sp}_{mode}": jit.load(misc, f"n3_router3_s{sp}_{mode}", (320, 1, 1), 0)
+            for sp in (3, 1)
+            for mode in ("cp", "pf")
+        },
         "gate_route_late+st": jit.load(gate_late, "n3_gate_route", (384, 1, 1), 0),
         "gate_topk": reg.load_gate_topk(device_index),
         "gate_route": reg.load_gate_route(device_index),
@@ -433,11 +518,14 @@ class Chain:
 
             tiny_gemm_bf16(self.x, layer.w, out=buf["logits"], max_m=a.router_max_m)
         else:
-            # replica | early | r2s3 | r2s1 | r2s3e | r2s1e
+            # replica | early | r2s3 | r2s1 | r2s3e | r2s1e | r3s{3,1}{cp,pf}[e]
             name, ctas = "router", 128
             if router.startswith("r2"):
                 split = int(router[3])
                 name, ctas = f"router2_s{split}", ROUTER_EXPERTS // split
+            if router.startswith("r3"):
+                split = int(router[3])
+                name, ctas = f"router3_s{split}_{router[4:6]}", ROUTER_EXPERTS // split
             reg._launch(
                 self.k[name],
                 (ctas, 1, 1),
@@ -446,7 +534,7 @@ class Chain:
                     _p(layer.w),
                     _p(buf["logits"]),
                     ctypes.c_int32(ROWS),
-                    ctypes.c_int32(1 if router in ("early", "r2s3e", "r2s1e") else 0),
+                    ctypes.c_int32(1 if router == "early" or (router[:2] in ("r2", "r3") and router.endswith("e")) else 0),
                     _np(st["router"] if st else None),
                 ],
                 s,
@@ -676,7 +764,15 @@ def check_router(chain):
     for rows in range(1, 9):
         x = torch.randn(rows, HIDDEN, device=chain.device, generator=gen).bfloat16()
         want = tiny_gemm_bf16(x, w, out_dtype=torch.float32, max_m=16)
-        for name, ctas in (("router", 128), ("router2_s3", 128), ("router2_s1", 384)):
+        for name, ctas in (
+            ("router", 128),
+            ("router2_s3", 128),
+            ("router2_s1", 384),
+            ("router3_s3_cp", 128),
+            ("router3_s1_cp", 384),
+            ("router3_s3_pf", 128),
+            ("router3_s1_pf", 384),
+        ):
             for early in (0, 1):
                 got = torch.empty(rows, ROUTER_EXPERTS, dtype=torch.float32, device=chain.device)
                 reg._launch(
@@ -703,7 +799,8 @@ def main():
     p.add_argument(
         "--router",
         default="sglang",
-        choices=["sglang", "replica", "early", "r2s3", "r2s1", "r2s3e", "r2s1e"],
+        choices=["sglang", "replica", "early", "r2s3", "r2s1", "r2s3e", "r2s1e"]
+        + [f"r3s{sp}{m}{e}" for sp in (3, 1) for m in ("cp", "pf") for e in ("", "e")],
     )
     p.add_argument("--router-max-m", type=int, default=16)
     p.add_argument("--side", type=int, nargs="+", default=[0, 1])

@@ -169,6 +169,31 @@ def test_draft_wo_b_reads_the_fused_wo_a_rows():
     print(f"GEMM_REL_WORST draft_wo_b {worst:.3e}")
 
 
+@needs_ll_gemm
+def test_tp8_wq_b_takes_its_own_tactics_and_the_indexer_keeps_its_pin():
+    """Attention TP8's wq_b (N 4096, K 1280) has the indexer wq_b's shape: its tactics
+    are asked for by consumer, so the indexer's bucket-8 pin (TP4) does not move; on
+    them the GEMM is SGLang's MXFP8 linear up to summation order, rerun bitwise."""
+    major, minor = torch.cuda.get_device_capability()
+    sm = major * 10 + minor
+    n, k = SHAPES["index_wq_b"]
+    assert mxfp8_ll.select_tactic(sm, n, k, 8) == mxfp8_ll.PINNED_TACTICS[sm, n, k]
+    gen = torch.Generator(device="cuda").manual_seed(41)
+    w, w_sf = _synthetic_weight(n, k, gen)
+    for rows in (1, 2, 5, 6, 8, 12, 16):
+        bucket = mxfp8_ll.row_bucket(rows)
+        tactic = mxfp8_ll.select_tactic(sm, n, k, bucket, mxfp8_ll.WQ_B_TP8)
+        pinned = mxfp8_ll.CONSUMER_TACTICS.get((mxfp8_ll.WQ_B_TP8, sm, n, k, bucket))
+        assert pinned is None or tactic == pinned, (rows, tactic, pinned)
+        x = _activations(rows, k, gen)
+        out, a = _ll(x, w, w_sf, tactic=tactic)
+        assert torch.equal(_ll(x, w, w_sf, tactic=tactic)[0], out)
+        a8, a8_sf = mxfp8_ll.quantize(x)
+        rel, _ = _rel(out, _cute_dsl(a8, a8_sf, w, w_sf))
+        print(f"GEMM_REL wq_b_tp8 rows={rows} tactic={tactic} norm_rel={rel:.3e}")
+        assert rel <= GEMM_NORM_REL, (rows, rel)
+
+
 # --- KV tolerance --------------------------------------------------------------------
 
 

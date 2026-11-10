@@ -239,7 +239,7 @@ def precompile(stages, kernels: dict[int, Kernels], widths) -> None:
         if k.wo_b_ll and ll_rows:
             mxfp8_ll.precompile(attn.wo_b.weight, ll_rows)
         if k.qfront:
-            mxfp8_ll.precompile(attn.wq_b.weight, rows)
+            mxfp8_ll.precompile(attn.wq_b.weight, rows, chain.wq_b_consumer(attn))
             q = attn.q_lora_rank
             # the norm compiles its input's row stride: a view of the fused output
             width = q + (attn.head_dim if k.qkv_a is not None else 0)

@@ -143,6 +143,18 @@ BUCKET_TACTICS: dict[tuple[int, int, int, int], Tactic] = {
     (103, 1152, 5120, 32): (128, 8, 1, 4),
     (103, 1152, 5120, 64): (128, 9, 1, 2),
 }
+# Attention TP8's wq_b (N 4096, K 1280): the indexer wq_b's shape, whose bucket-8 pin
+# above it keeps (TP4 serves it); the chain asks for these by consumer instead. Best of
+# 80 per row count in a 40-layer chain on GB300 (2.21 vs 2.51 us at 6 rows, 2.22 vs
+# 2.69 at 1-4, 2.53 vs 2.77 at 12-16; benchmark/sweep_deepseek_v41_tactics.py).
+WQ_B_TP8 = "wq_b_tp8"
+CONSUMER_TACTICS: dict[tuple[str, int, int, int, int], Tactic] = {
+    (WQ_B_TP8, 103, 4096, 1280, 1): (128, 10, 1, 2),
+    (WQ_B_TP8, 103, 4096, 1280, 2): (128, 10, 1, 2),
+    (WQ_B_TP8, 103, 4096, 1280, 4): (128, 10, 1, 2),
+    (WQ_B_TP8, 103, 4096, 1280, 8): (128, 10, 1, 2),
+    (WQ_B_TP8, 103, 4096, 1280, 16): (256, 6, 1, 1),
+}
 _COMPILED: dict[tuple[int, Tactic], object] = {}
 
 
@@ -170,10 +182,15 @@ def offered_tactics(n: int, k: int, rows: int) -> list[Tactic]:
 
 
 @lru_cache(maxsize=None)
-def select_tactic(sm_version: int, n: int, k: int, bucket: int) -> Tactic:
+def select_tactic(
+    sm_version: int, n: int, k: int, bucket: int, consumer: Optional[str] = None
+) -> Tactic:
     """The pinned tactic of this row bucket if FlashInfer offers it, else FlashInfer's
-    default (its first tactic): fixed per bucket, never tuned per process."""
-    pinned = BUCKET_TACTICS.get((sm_version, n, k, bucket))
+    default (its first tactic): fixed per bucket, never tuned per process. A
+    ``consumer`` (``CONSUMER_TACTICS``) takes its own pin first."""
+    pinned = CONSUMER_TACTICS.get((consumer, sm_version, n, k, bucket))
+    if pinned is None:
+        pinned = BUCKET_TACTICS.get((sm_version, n, k, bucket))
     if pinned is None and bucket == MAX_ROWS:
         pinned = PINNED_TACTICS.get((sm_version, n, k))
     offered = offered_tactics(n, k, min(bucket, MAX_ROWS))
@@ -226,12 +243,15 @@ def _ptr(dtype, address: int, align: int):
     return make_ptr(dtype, address, cute.AddressSpace.gmem, assumed_align=align)
 
 
-def precompile(weight: torch.Tensor, rows: list[int]) -> None:
+def precompile(
+    weight: torch.Tensor, rows: list[int], consumer: Optional[str] = None
+) -> None:
     """Compile the kernels these row counts select; call before CUDA graph capture."""
     n, k = weight.shape
     major, minor = torch.cuda.get_device_capability(weight.device)
     for r in rows:
-        _compiled(select_tactic(major * 10 + minor, n, k, row_bucket(r)), weight.device)
+        tactic = select_tactic(major * 10 + minor, n, k, row_bucket(r), consumer)
+        _compiled(tactic, weight.device)
 
 
 def linear(
@@ -242,6 +262,7 @@ def linear(
     *,
     out: Optional[torch.Tensor] = None,
     tactic: Optional[Tactic] = None,
+    consumer: Optional[str] = None,
 ) -> torch.Tensor:
     """``a @ weight.T`` in BF16 for MXFP8 rows ``a`` [M, K] (1 <= M <= 64) with their
     UE8M0 scales (FlashInfer's 128x4 swizzle up to 8 rows, the row-tile layout above),
@@ -258,7 +279,7 @@ def linear(
     assert a_scale.numel() >= scale_bytes(rows, k)
     if tactic is None:
         major, minor = torch.cuda.get_device_capability(a.device)
-        tactic = select_tactic(major * 10 + minor, n, k, row_bucket(rows))
+        tactic = select_tactic(major * 10 + minor, n, k, row_bucket(rows), consumer)
     if out is None:
         out = torch.empty((rows, n), dtype=torch.bfloat16, device=a.device)
     assert out.shape == (rows, n) and out.is_contiguous()

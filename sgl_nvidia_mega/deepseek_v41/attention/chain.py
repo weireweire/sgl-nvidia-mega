@@ -234,6 +234,12 @@ def index_q_mxfp8_applies(attn) -> bool:
     )
 
 
+def wq_b_consumer(attn):
+    """The low-latency GEMM's tactic table for this wq_b: attention TP8's 8 heads have
+    their own (``mxfp8_ll.CONSUMER_TACTICS``)."""
+    return mxfp8_ll.WQ_B_TP8 if attn.n_local_heads == 8 else None
+
+
 def wq_b_ll_applies(attn) -> bool:
     """wq_b runs on the low-latency GEMM, fed by the chain's PDL norm + quant."""
     return _ll_linear_applies(attn.wq_b) and attn.q_norm.weight.dtype == torch.bfloat16
@@ -341,7 +347,11 @@ class ChainOps:
 
         if self.wq_b_ll:
             out = mxfp8_ll.linear(
-                q.quant, q.scale, attn.wq_b.weight, attn.wq_b.weight_scale_inv_swizzled
+                q.quant,
+                q.scale,
+                attn.wq_b.weight,
+                attn.wq_b.weight_scale_inv_swizzled,
+                consumer=wq_b_consumer(attn),
             )
         elif self.rope_in_attention:
             out = attn.wq_b(q)[0]
@@ -504,7 +514,7 @@ def precompile(
     if not rows:
         return
     if wq_b_ll_applies(attn):
-        mxfp8_ll.precompile(attn.wq_b.weight, rows)
+        mxfp8_ll.precompile(attn.wq_b.weight, rows, wq_b_consumer(attn))
         k = attn.q_lora_rank
         # q_lora as the prepare paths slice it: a view of wqkv_a's output when fused
         width = attn.wqkv_a.weight.shape[0] if attn.fuse_wqa_wkv else k

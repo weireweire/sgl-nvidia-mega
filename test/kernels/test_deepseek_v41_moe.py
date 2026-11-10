@@ -551,3 +551,207 @@ def test_shared_gate_up_at_the_tp8_shard(rows):
     )
     mlp = SimpleNamespace(shared_experts=shared, num_fused_shared_experts=0)
     assert shared_ll.why_not(mlp) == ""
+
+
+# ------------------------------------------------- slot gate_route (top-k + route fused)
+
+
+def _gate_route_logits(kind, rows, experts, gen):
+    if kind == "one_expert":  # every row's first choice is the same expert
+        x = torch.randn((rows, experts), device="cuda", generator=gen)
+        x[:, 7] = 30.0
+        return x
+    if kind == "distinct":  # every row on its own experts
+        x = torch.full((rows, experts), -5.0, device="cuda")
+        top_k = TARGET_TOP_K if experts == TARGET_EXPERTS else DRAFT_TOP_K
+        for r in range(rows):
+            for k in range(top_k):
+                x[r, (r * top_k + k) % experts] = 3.0 + k
+        return x
+    if kind == "cutoff_ties":  # equal scores straddle the top-k cutoff
+        x = torch.randn((rows, experts), device="cuda", generator=gen) - 4.0
+        x[:, 3:12] = 2.0
+        return x
+    shape_kind = {"normal": "normal", "wide": "wide", "ties": "ties", "nan": "nan"}
+    x = _logits(shape_kind[kind], rows, gen)
+    return x if experts == TARGET_EXPERTS else x[:, :experts].contiguous()
+
+
+def _check_gate_route(layer, *, top_k, rows, kind, offset, vision, padded, graph, seed):
+    """gate_topk_and_gemms with slot gate_route against the gate_topk + route kernels on
+    the same layer half: ids, weights, slot -> row map, route record and GEMM2 rows bit
+    for bit."""
+    experts = layer[0].size(0)
+    router_experts = experts * (2 if offset is not None else 1)
+    generator = torch.Generator().manual_seed(seed)
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    x_q, x_s = _quantized_rows(rows, generator)
+    logits = _gate_route_logits(kind, rows, router_experts, gen).contiguous()
+    bias = torch.randn(router_experts, device="cuda", generator=gen) * 0.05
+    valid = max(1, rows - 2) if padded else rows
+    num_valid = torch.tensor([valid], dtype=torch.int32, device="cuda")
+    alt = None
+    if vision:
+        bias_alt = torch.randn(router_experts, device="cuda", generator=gen) * 0.5
+        input_ids = torch.randint(0, 50, (rows,), device="cuda", generator=gen)
+        input_ids[::2] = 17  # every other row is an image token
+        alt = (bias_alt, input_ids, 17)
+    eps = EPS if vision else 0.0
+    gemms = {
+        fused: reg.RoutedExpertGemm(
+            *layer,
+            top_k=top_k,
+            max_rows=reg.SERVED_MAX_ROWS,
+            gate_topk=True,
+            router_experts=router_experts,
+            expert_offset=offset or 0,
+            gate_route=fused,
+        )
+        for fused in (False, True)
+    }
+    assert gemms[True].serves_gate_route(rows) == (rows <= reg.MAX_ROWS)
+    got = {}
+    for fused, gemm in gemms.items():
+
+        def run():
+            return gemm.gate_topk_and_gemms(
+                x_q, x_s, logits, bias, SCALE, num_valid, alt=alt, renormalize_epsilon=eps
+            )
+
+        if graph:
+            run()
+            torch.cuda.synchronize()
+            captured = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(captured):
+                out = run()
+            for t in out:
+                t.zero_()
+            for _ in range(3):
+                captured.replay()
+        else:
+            out = run()
+        torch.cuda.synchronize()
+        got[fused] = out
+    where = f"rows={rows} kind={kind} offset={offset} vision={vision} padded={padded} graph={graph}"
+    (r0, w0, p0, i0), (r1, w1, p1, i1) = got[False], got[True]
+    assert torch.equal(i1, i0), where
+    assert torch.equal(w1.view(torch.int32), w0.view(torch.int32)), where
+    assert torch.equal(p1, p0), where
+    kept = p0 >= 0
+    a = r1[p1.clamp(min=0).long()][kept]
+    b = r0[p0.clamp(min=0).long()][kept]
+    assert torch.equal(a.view(torch.int16), b.view(torch.int16)), where
+    if not graph:  # the stock gate on the same logits: the router's choice
+        sw, sid = _stock_any(logits, bias, num_valid, top_k, alt)
+        assert torch.equal(i1, sid), where
+        assert torch.equal(w1.view(torch.int32), sw.view(torch.int32)), where
+
+
+def _stock_any(logits, bias, num_valid, top_k, alt):
+    from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
+
+    extra = {}
+    if alt is not None:
+        bias_alt, input_ids, token = alt
+        extra = dict(
+            bias_alt=bias_alt,
+            input_ids=input_ids,
+            bias_alt_token_id=token,
+            renormalize_epsilon=EPS,
+        )
+    w, ids = moe_fused_gate(
+        logits,
+        bias,
+        topk=top_k,
+        scoring_func="sqrtsoftplus",
+        num_fused_shared_experts=0,
+        renormalize=True,
+        routed_scaling_factor=SCALE,
+        apply_routed_scaling_factor_on_output=True,
+        num_token_non_padded=num_valid,
+        sqrtsoftplus_log1p=True,
+        **extra,
+    )
+    return w, ids.to(torch.int32)
+
+
+@needs_moe
+@pytest.mark.parametrize("rows", [1, 2, 3, 5, 6, 7, 8, 12, 48])
+@pytest.mark.parametrize(
+    "kind", ["normal", "ties", "cutoff_ties", "one_expert", "distinct", "nan"]
+)
+@pytest.mark.parametrize("window", ["all", "ep0", "ep1"])
+def test_gate_route_matches_gate_topk_and_route(target_layer, rows, kind, window):
+    layer, offset = (
+        (target_layer, None) if window == "all" else _ep_half(target_layer, int(window[-1]))
+    )
+    for vision, padded, graph in ((False, False, False), (True, True, False), (False, True, True), (True, False, True)):
+        _check_gate_route(
+            layer,
+            top_k=TARGET_TOP_K,
+            rows=rows,
+            kind=kind,
+            offset=offset,
+            vision=vision,
+            padded=padded,
+            graph=graph,
+            seed=5000 + rows,
+        )
+
+
+@needs_moe
+@pytest.mark.parametrize("rows", [1, 3, 5, 8, 10])
+@pytest.mark.parametrize("kind", ["normal", "ties", "one_expert", "distinct"])
+@pytest.mark.parametrize("window", ["all", "ep0", "ep1"])
+def test_draft_gate_route_matches_gate_topk_and_route(draft_layer, rows, kind, window):
+    layer, offset = (
+        (draft_layer, None) if window == "all" else _ep_half(draft_layer, int(window[-1]))
+    )
+    for vision, padded, graph in ((False, False, False), (True, True, True)):
+        _check_gate_route(
+            layer,
+            top_k=DRAFT_TOP_K,
+            rows=rows,
+            kind=kind,
+            offset=offset,
+            vision=vision,
+            padded=padded,
+            graph=graph,
+            seed=6000 + rows,
+        )
+
+
+@needs_moe
+@pytest.mark.parametrize("rows", [1, 6, 8])
+def test_gate_route_record_matches_route_kernel(target_layer, rows):
+    """The fused kernel's route record (every word GEMM1 / GEMM2 read) equals route.cu's."""
+    half, offset = _ep_half(target_layer, 1)
+    gen = torch.Generator(device="cuda").manual_seed(77 + rows)
+    logits = torch.randn(rows, TARGET_EXPERTS, device="cuda", generator=gen)
+    bias = torch.randn(TARGET_EXPERTS, device="cuda", generator=gen) * 0.05
+    num_valid = torch.tensor([rows], dtype=torch.int32, device="cuda")
+    gemm = reg.RoutedExpertGemm(
+        *half,
+        top_k=TARGET_TOP_K,
+        max_rows=reg.SERVED_MAX_ROWS,
+        gate_topk=True,
+        router_experts=TARGET_EXPERTS,
+        expert_offset=offset,
+        gate_route=True,
+    )
+    records = {}
+    real = gemm._gemms
+
+    def capture(x_q, x_s, record, ctas):
+        records[len(records)] = record.clone()
+        return real(x_q, x_s, record, ctas)
+
+    gemm._gemms = capture
+    x_q, x_s = _quantized_rows(rows, torch.Generator().manual_seed(rows))
+    gemm.gate_topk_and_gemms(x_q, x_s, logits, bias, SCALE, num_valid)
+    kernel = gemm.gate_route_kernel
+    gemm.gate_route_kernel = None
+    gemm.gate_topk_and_gemms(x_q, x_s, logits, bias, SCALE, num_valid)
+    gemm.gate_route_kernel = kernel
+    torch.cuda.synchronize()
+    assert torch.equal(records[0], records[1]), rows

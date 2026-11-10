@@ -19,6 +19,11 @@
 
 #pragma once
 
+// Timeline hook of benchmark builds (benchmark/bench_deepseek_v41_moe_chain.py); empty here.
+#ifndef DSV41_STAMP
+#define DSV41_STAMP(i)
+#endif
+
 namespace {
 // Order-preserving u32 key of a score (+0 for -0); 0 marks a taken expert.
 __device__ __forceinline__ unsigned int Key(float v) {
@@ -46,43 +51,31 @@ __device__ __forceinline__ float RoutedSum(const float (&w)[kTopK]) {
   }
 }
 
-// grid = rows, block = kExperts. num_valid: rows >= *num_valid get weight 0 and id -1 (padded
-// graph rows), as moe_fused_gate's num_token_non_padded; null means every row is valid. With
-// input_ids (int32, or int64 when ids64), a row whose token is alt_token_id ranks with
-// bias_alt instead of bias (DSV4.1 VL routing). eps > 0 normalizes by sum + eps, as
-// renormalize_epsilon; else by the guarded sum.
+// One row's routing, block = kExperts threads (one expert each): the row's score s and its
+// bias b (thread e's), the row's validity. Every thread of the block calls it (it
+// synchronizes the block once); afterwards warp 0's lanes < kTopK hold slot `lane`'s weight
+// and id (id -1, weight 0 for an invalid row) and every lane of warp 0 holds all kTopK ids
+// in row_ids; the other warps' results are unspecified. eps > 0 normalizes by sum + eps,
+// as renormalize_epsilon; else by the guarded sum.
 template <int kExperts, int kTopK>
-__device__ __forceinline__ void GateTopK(
-    const float* logits, const float* bias, const float* bias_alt, const void* input_ids, int ids64,
-    long long alt_token_id, const int* num_valid, float* __restrict__ weights, int* __restrict__ ids,
-    float scale, float eps) {
+struct GateScratch {
+  unsigned int cand_key[(kExperts / 32) * kTopK];
+  int cand_id[(kExperts / 32) * kTopK];
+  float cand_act[(kExperts / 32) * kTopK];
+};
+
+template <int kExperts, int kTopK>
+__device__ __forceinline__ void SelectRow(
+    GateScratch<kExperts, kTopK>& scratch, float s, float b, bool valid_row, float scale, float eps,
+    float& out_w, int& out_id, int (&row_ids)[kTopK]) {
   constexpr int kThreads = kExperts;
   constexpr int kWarps = kThreads / 32;
   constexpr int kCandidates = kWarps * kTopK;
   constexpr int kSlots = (kCandidates + 31) / 32;  // candidates per merging lane
   static_assert(kExperts % 32 == 0 && kTopK <= 32, "one expert per thread, whole warps");
-
-  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-  __shared__ unsigned int cand_key[kCandidates];
-  __shared__ int cand_id[kCandidates];
-  __shared__ float cand_act[kCandidates];
   const int e = static_cast<int>(threadIdx.x);
   const int lane = e & 31;
   const int warp = e >> 5;
-  const int row = static_cast<int>(blockIdx.x);
-  const float b_main = bias[e];
-  const float b_alt = bias_alt != nullptr ? bias_alt[e] : b_main;
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-
-  const int valid = num_valid != nullptr ? *num_valid : static_cast<int>(gridDim.x);
-  bool alt = false;
-  if (input_ids != nullptr && row < valid) {
-    const long long token = ids64 ? static_cast<const long long*>(input_ids)[row]
-                                  : static_cast<long long>(static_cast<const int*>(input_ids)[row]);
-    alt = token == alt_token_id;
-  }
-  const float b = alt ? b_alt : b_main;
-  const float s = logits[row * kExperts + e];
   const float sp = s > 20.0f ? s : log1pf(expf(s));
   const float act = sqrtf(sp);
   const float biased = act + b;
@@ -94,9 +87,9 @@ __device__ __forceinline__ void GateTopK(
     const unsigned int top = __reduce_max_sync(0xffffffffU, key);
     const unsigned int win = __reduce_min_sync(0xffffffffU, key == top ? static_cast<unsigned int>(e) : 0xffffffffU);
     if (static_cast<unsigned int>(e) == win) {
-      cand_key[warp * kTopK + k] = key;
-      cand_id[warp * kTopK + k] = e;
-      cand_act[warp * kTopK + k] = act;
+      scratch.cand_key[warp * kTopK + k] = key;
+      scratch.cand_id[warp * kTopK + k] = e;
+      scratch.cand_act[warp * kTopK + k] = act;
       key = 0U;
     }
   }
@@ -109,8 +102,8 @@ __device__ __forceinline__ void GateTopK(
 #pragma unroll
   for (int j = 0; j < kSlots; ++j) {
     const int c = lane + 32 * j;
-    ck[j] = c < kCandidates ? cand_key[c] : 0U;
-    ci[j] = c < kCandidates ? cand_id[c] : kExperts;
+    ck[j] = c < kCandidates ? scratch.cand_key[c] : 0U;
+    ci[j] = c < kCandidates ? scratch.cand_id[c] : kExperts;
   }
   float sel_w[kTopK];
   int sel_i[kTopK];
@@ -133,22 +126,67 @@ __device__ __forceinline__ void GateTopK(
     }
     const unsigned int owner = __ballot_sync(0xffffffffU, slot >= 0);
     const int src = __shfl_sync(0xffffffffU, slot, __ffs(owner) - 1);
-    sel_w[k] = cand_act[src];
+    sel_w[k] = scratch.cand_act[src];
     sel_i[k] = id;
   }
   const float sum = RoutedSum<kTopK>(sel_w);
   const float norm = eps > 0.0f ? sum + eps : (sum > 0.0f ? sum : 1.0f);
+#pragma unroll
+  for (int k = 0; k < kTopK; ++k) row_ids[k] = valid_row ? sel_i[k] : -1;
+  float w = 0.0f;
+  int id = 0;
   if (lane < kTopK) {
-    float w = 0.0f;
-    int id = 0;
 #pragma unroll
     for (int k = 0; k < kTopK; ++k) {
       if (lane == k) { w = sel_w[k]; id = sel_i[k]; }
     }
     w = DivFull(w, norm) * scale;
-    if (row >= valid) { w = 0.0f; id = -1; }
+    if (!valid_row) { w = 0.0f; id = -1; }
+  }
+  out_w = w;
+  out_id = id;
+}
+
+// grid = rows, block = kExperts. num_valid: rows >= *num_valid get weight 0 and id -1 (padded
+// graph rows), as moe_fused_gate's num_token_non_padded; null means every row is valid. With
+// input_ids (int32, or int64 when ids64), a row whose token is alt_token_id ranks with
+// bias_alt instead of bias (DSV4.1 VL routing). eps > 0 normalizes by sum + eps, as
+// renormalize_epsilon; else by the guarded sum.
+template <int kExperts, int kTopK>
+__device__ __forceinline__ void GateTopK(
+    const float* logits, const float* bias, const float* bias_alt, const void* input_ids, int ids64,
+    long long alt_token_id, const int* num_valid, float* __restrict__ weights, int* __restrict__ ids,
+    float scale, float eps) {
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  DSV41_STAMP(0);
+  __shared__ GateScratch<kExperts, kTopK> scratch;
+  const int e = static_cast<int>(threadIdx.x);
+  const int lane = e & 31;
+  const int warp = e >> 5;
+  const int row = static_cast<int>(blockIdx.x);
+  const float b_main = bias[e];
+  const float b_alt = bias_alt != nullptr ? bias_alt[e] : b_main;
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  DSV41_STAMP(1);
+
+  const int valid = num_valid != nullptr ? *num_valid : static_cast<int>(gridDim.x);
+  bool alt = false;
+  if (input_ids != nullptr && row < valid) {
+    const long long token = ids64 ? static_cast<const long long*>(input_ids)[row]
+                                  : static_cast<long long>(static_cast<const int*>(input_ids)[row]);
+    alt = token == alt_token_id;
+  }
+  const float b = alt ? b_alt : b_main;
+  const float s = logits[row * kExperts + e];
+  float w;
+  int id;
+  int row_ids[kTopK];
+  SelectRow<kExperts, kTopK>(scratch, s, b, row < valid, scale, eps, w, id, row_ids);
+  DSV41_STAMP(2);
+  if (warp == 0 && lane < kTopK) {
     weights[row * kTopK + lane] = w;
     ids[row * kTopK + lane] = id;
   }
+  DSV41_STAMP(3);
 }
 }  // namespace

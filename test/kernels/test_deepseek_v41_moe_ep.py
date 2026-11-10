@@ -122,6 +122,9 @@ def env():
             group=tp.device_group,
             deadline_s=30.0,
         )
+        from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
+
+        # slot gate_route (SGLANG_NVIDIA_MEGAKERNEL_SLOTS): top-k + route in one launch
         pair = reg.RoutedExpertGemm(
             *full,
             top_k=TOP_K,
@@ -129,6 +132,7 @@ def env():
             gate_topk=True,
             router_experts=EXPERTS,
             expert_offset=offset,
+            gate_route="gate_route" in SLOTS,
         )
     yield SimpleNamespace(
         rank=rank,
@@ -254,6 +258,8 @@ def test_pair_widths_gate_route_gemms_hop_b(env):
         a = _step_inputs(rows, 700 + rows, env.rank, env.device)
         where = f"rank {env.rank} rows={rows}"
         assert env.pair.supports_gate_topk(a.logits, a.bias), where
+        if env.pair.gate_route_kernel is not None:
+            assert env.pair.serves_gate_route(rows) == (rows <= reg.MAX_ROWS), where
         rows_out, weights, permuted, ids = env.pair.gate_topk_and_gemms(
             a.x_q, a.x_s, a.logits, a.bias, SCALE, a.num_valid
         )
@@ -306,7 +312,8 @@ def test_pair_widths_gate_route_gemms_hop_b(env):
         )
         if env.rank == 0:
             print(
-                f"EP2 pair rows={rows}: kept {int(local.sum())}/{local.numel()} slots; "
+                f"EP2 pair rows={rows} gate_route="
+                f"{env.pair.serves_gate_route(rows)}: kept {int(local.sum())}/{local.numel()} slots; "
                 f"hop B vs one-shot streams max_ulp={int(streams_ulps.max())}, "
                 f"vs SGLang's whole chain max_abs="
                 f"{(streams.float() - whole[0].float()).abs().max().item():.3g}",

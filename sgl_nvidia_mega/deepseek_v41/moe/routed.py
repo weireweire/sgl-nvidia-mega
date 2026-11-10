@@ -217,12 +217,23 @@ def build(
 
 
 def build_layers(
-    layers, group, *, gate_topk: bool, shared_ll: bool = False, widths=()
+    layers,
+    group,
+    *,
+    gate_topk: bool,
+    shared_ll: bool = False,
+    widths=(),
+    gate_route: bool | None = None,
 ) -> Bound:
     """``build`` over a list of decoder layers (the target's, or the draft's stages),
     keyed by ``layer_id``. With ``shared_ll``, each built layer's shared expert on the
     low-latency GEMM where it applies, compiled for ``widths``; every rank agrees on
-    those layers too, or none takes it."""
+    those layers too, or none takes it. ``gate_route`` (default: slot gate_route
+    requested): the fast top-k and the route record in one launch at 1-8 rows."""
+    if gate_route is None:
+        from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
+
+        gate_route = "gate_route" in SLOTS
     from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
         Mxfp4FlashinferTrtllmMoEMethod,
     )
@@ -254,6 +265,7 @@ def build_layers(
                 gate_topk=gate_topk,
                 router_experts=experts.num_experts,
                 expert_offset=expert_offset(experts),
+                gate_route=gate_route,
             )
             gate = gate_topk and gemm.gate_topk_kernel is not None and gate_applies(mlp)
             slots[i] = MoeSlot(mlp, gemm, gate=gate)

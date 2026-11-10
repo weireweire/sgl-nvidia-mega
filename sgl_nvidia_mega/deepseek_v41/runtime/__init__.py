@@ -124,6 +124,9 @@ DRAFT_SLOTS = frozenset(
 # attn_index_after_wait: on the indexer layers, swap-AB reads a stock top-k's selection
 # only after its PDL wait (a captured stream join is a programmatic edge and the stock
 # top-k triggers before it writes; bitwise)
+# TP8 arm); no effect at TP4; gate_route: the router's top-k and the routed pair's route
+# record in one cluster launch at 1-8 rows, target and draft (sm103/moe/src/gate_route.cuh;
+# bitwise with gate_topk + route))
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -145,6 +148,7 @@ OPT_IN_SLOTS = (
     "engram_side_ar",
     "hc_coeff_fused",
     "attn_index_after_wait",
+    "gate_route",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -190,6 +194,7 @@ def slot_reasons() -> list[str]:
         ("shared_fold_quant", "shared_fold"),
         ("shared_fold_early_release", "shared_fold_quant"),
         ("gate_wide", "gate"),
+        ("gate_route", "gate"),
         ("hop_a_batch2", "hop_a"),
         ("attn_qkv_a", "attn"),
         ("attn_indexer", "attn"),

@@ -134,10 +134,14 @@ def step(layer: torch.nn.Module, m_in: torch.Tensor, st) -> object:
 _FAST_GATE_SERVED: set = set()
 
 
-def _log_fast_gate(rows: int) -> None:
-    if rows not in _FAST_GATE_SERVED:
-        _FAST_GATE_SERVED.add(rows)
-        logger.info("NVIDIA megakernel: fast gate top-k serves %d rows", rows)
+def _log_fast_gate(rows: int, fused: bool = False) -> None:
+    if (rows, fused) not in _FAST_GATE_SERVED:
+        _FAST_GATE_SERVED.add((rows, fused))
+        logger.info(
+            "NVIDIA megakernel: fast gate top-k serves %d rows%s",
+            rows,
+            " with the route record in one launch (gate_route)" if fused else "",
+        )
 
 
 # engagement of slot shared_ll, as above
@@ -262,7 +266,12 @@ def _dual_stream(
     )
 
     if fast_gate:
-        _log_fast_gate(x.shape[0])
+        _log_fast_gate(
+            x.shape[0],
+            slot.gemm.serves_gate_route(
+                x.shape[0], input_ids_global if use_vision_topk else None
+            ),
+        )
         router_logits = mlp.gate(x, None)
         topk_output = slot.select(
             router_logits, input_ids_global, num_token_non_padded, use_vision_topk

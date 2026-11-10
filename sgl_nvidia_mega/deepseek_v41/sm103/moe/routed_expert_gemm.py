@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 from functools import cache
 from pathlib import Path
 from typing import Optional
@@ -51,6 +52,20 @@ HEADERS = ("route.cuh",)
 GEMM1_PARAMETERS = ("A", "SFA", "X", "XS", "route", "clamp", "H", "HS", "cta_words")
 GEMM2_PARAMETERS = ("A", "SFA", "H", "HS", "route", "Y", "cta_words")
 PARAMETERS = {"gemm1": GEMM1_PARAMETERS, "gemm2": GEMM2_PARAMETERS}
+# SGL_NVIDIA_MEGA_MOE_STRIDED_GEMM=1: the GEMM pair on a strided 1-D grid of
+# min(SMs - STRIDED_SIDE_SMS, tiles) CTAs instead of cluster launch control over every
+# SM, so the shared expert and hC kernels on the side streams keep SMs (the reference
+# tools/routed_expert_gemm_strided.py builds of these same kernels). The 384-expert
+# top-6 GEMM1 whose largest routing can need a partial second round strides over a
+# balanced CTA count instead. Every tile stays whole on one CTA: bitwise either way.
+STRIDED_GEMM = os.environ.get("SGL_NVIDIA_MEGA_MOE_STRIDED_GEMM", "0") == "1"
+STRIDED_SIDE_SMS = 8
+# (kernel name, launch.json entry, source)
+STRIDED_KERNELS = (
+    ("gemm1_strided", "gemm1", "gemm1_strided.cu"),
+    ("gemm1_balanced", "gemm1", "gemm1_strided_balanced.cu"),
+    ("gemm2_strided", "gemm2", "gemm2_strided.cu"),
+)
 
 
 def compile_source(source, name, arch, options=NVRTC_OPTIONS, headers=None) -> bytes:
@@ -125,6 +140,15 @@ def load_kernels(device_index: int) -> dict[str, _Kernel]:
                 fact["block"],
                 int(fact["shared_memory_bytes"]),
             )
+        if STRIDED_GEMM:
+            for name, entry, file in STRIDED_KERNELS:
+                fact = facts[entry]
+                kernels[name] = _load(
+                    compile_source((SOURCE_DIR / file).read_text(), name, arch),
+                    fact["symbol"],
+                    fact["block"],
+                    int(fact["shared_memory_bytes"]),
+                )
         return kernels
 
 
@@ -151,6 +175,16 @@ GATE_TOPK_NVRTC_OPTIONS = (
     "--prec-div=false",
 )
 GATE_TOPK_HEADERS = ("gate_topk.cuh",)
+# slot gate_route: the router's top-k and the route record in one cluster launch of one CTA
+# per row (gate_route.cuh), at 1-MAX_ROWS rows; per router (experts, top_k) as gate_topk
+GATE_ROUTE_VARIANTS = {
+    (GATE_TOPK_EXPERTS, GATE_TOPK_TOP_K): ("gate_route", "dsv41_gate_route"),
+    (DRAFT_GATE_TOPK_EXPERTS, DRAFT_GATE_TOPK_TOP_K): (
+        "gate_route_draft",
+        "dsv41_gate_route_e128_k3",
+    ),
+}
+GATE_ROUTE_HEADERS = ("gate_topk.cuh", "route.cuh", "gate_route.cuh")
 
 
 @cache
@@ -165,6 +199,28 @@ def load_gate_topk(
         major, minor = torch.cuda.get_device_capability(device)
         source = (SOURCE_DIR / f"{name}.cu").read_text()
         headers = {h: (SOURCE_DIR / h).read_text() for h in GATE_TOPK_HEADERS}
+        cubin = compile_source(
+            source,
+            name,
+            f"sm_{major}{minor}a",
+            GATE_TOPK_NVRTC_OPTIONS,
+            headers=headers,
+        )
+        return _load(cubin, symbol, (experts, 1, 1), 0)
+
+
+@cache
+def load_gate_route(
+    device_index: int, experts: int = GATE_TOPK_EXPERTS, top_k: int = GATE_TOPK_TOP_K
+) -> _Kernel:
+    """The fused top-k + route kernel of the (experts, top_k) router (slot gate_route)."""
+    name, symbol = GATE_ROUTE_VARIANTS[(experts, top_k)]
+    device = torch.device("cuda", device_index)
+    with torch.cuda.device(device):
+        torch.zeros(1, device=device)
+        major, minor = torch.cuda.get_device_capability(device)
+        source = (SOURCE_DIR / f"{name}.cu").read_text()
+        headers = {h: (SOURCE_DIR / h).read_text() for h in GATE_ROUTE_HEADERS}
         cubin = compile_source(
             source,
             name,
@@ -280,9 +336,12 @@ class RoutedExpertGemm:
         gate_topk: bool = False,
         router_experts: Optional[int] = None,
         expert_offset: int = 0,
+        gate_route: bool = False,
     ):
         """``router_experts``: the router's expert count (default: the local ones);
-        ``expert_offset``: the router id of local expert 0 (expert parallelism)."""
+        ``expert_offset``: the router id of local expert 0 (expert parallelism);
+        ``gate_route`` (with ``gate_topk``): at 1-8 rows the top-k and the route record
+        in one launch (gate_route.cuh)."""
         w13, w13_scale = w13.view(torch.uint8), w13_scale.view(torch.uint8)
         w2, w2_scale = w2.view(torch.uint8), w2_scale.view(torch.uint8)
         check_weights(w13, w13_scale, w2, w2_scale, clamp, top_k)
@@ -317,6 +376,13 @@ class RoutedExpertGemm:
             if gate_topk and fits_gate_topk
             else None
         )
+        self.gate_route_kernel = (
+            load_gate_route(w13.device.index, self.router_experts, top_k)
+            if self.gate_topk_kernel is not None
+            and gate_route
+            and (self.router_experts, top_k) in GATE_ROUTE_VARIANTS
+            else None
+        )
         # route.cu flips bit 31 of this word on every launch.
         self.barrier = torch.zeros(1, dtype=torch.int32, device=w13.device)
         self._tensors = (
@@ -332,6 +398,34 @@ class RoutedExpertGemm:
             _scale_map(w13_scale, 4),
         )
         self.gemm2_maps = (_weight_map(w2, HIDDEN, PADDED, 2), _scale_map(w2_scale, 1))
+        self._strided_sms = (
+            torch.cuda.get_device_properties(w13.device).multi_processor_count
+            - STRIDED_SIDE_SMS
+            if STRIDED_GEMM
+            else 0
+        )
+
+    def _gemm_launches(self, ctas: int, top_k: int):
+        """(GEMM1 kernel, grid), (GEMM2 kernel, grid) for ``ctas`` token tiles; fixed
+        by the call's shape, never by its routes, so one graph keeps one kernel."""
+        if not self._strided_sms:
+            return (
+                (self.kernels["gemm1"], (GEMM1_UNITS, ctas, 1)),
+                (self.kernels["gemm2"], (GEMM2_UNITS, ctas, 1)),
+            )
+        tiles1 = GEMM1_UNITS * ctas
+        grid1 = min(self._strided_sms, tiles1)
+        balanced = self.experts == 384 and top_k == 6 and tiles1 > grid1
+        return (
+            (
+                self.kernels["gemm1_balanced" if balanced else "gemm1_strided"],
+                (grid1, 1, 1),
+            ),
+            (
+                self.kernels["gemm2_strided"],
+                (min(self._strided_sms, GEMM2_UNITS * ctas), 1, 1),
+            ),
+        )
 
     def supports(self, x_quant, x_scale, topk_ids, topk_weights) -> bool:
         rows = x_quant.size(0)
@@ -401,9 +495,10 @@ class RoutedExpertGemm:
             (rows * top_k * TILE, HIDDEN), dtype=torch.bfloat16, device=device
         )
         words = ctypes.c_int32(cta_words(ctas))
+        (gemm1, grid1), (gemm2, grid2) = self._gemm_launches(ctas, top_k)
         _launch(
-            self.kernels["gemm1"],
-            (GEMM1_UNITS, ctas, 1),
+            gemm1,
+            grid1,
             [
                 *self.gemm1_maps,
                 _pointer(x_quant),
@@ -417,8 +512,8 @@ class RoutedExpertGemm:
             stream,
         )
         _launch(
-            self.kernels["gemm2"],
-            (GEMM2_UNITS, ctas, 1),
+            gemm2,
+            grid2,
             [
                 *self.gemm2_maps,
                 _pointer(h_values),
@@ -456,29 +551,50 @@ class RoutedExpertGemm:
         weights = torch.empty((rows, self.top_k), dtype=torch.float32, device=device)
         ids = torch.empty((rows, self.top_k), dtype=torch.int32, device=device)
         bias_alt, input_ids, alt_token_id = alt if alt is not None else (None, None, -1)
-        _launch(
-            self.gate_topk_kernel,
-            (rows, 1, 1),
-            [
-                _pointer(logits),
-                _pointer(bias),
-                _null_or_pointer(bias_alt),
-                _null_or_pointer(input_ids),
-                ctypes.c_int32(
-                    input_ids is not None and input_ids.dtype == torch.int64
-                ),
-                ctypes.c_int64(alt_token_id),
-                _null_or_pointer(num_valid),
-                _pointer(weights),
-                _pointer(ids),
-                ctypes.c_float(routed_scaling_factor),
-                ctypes.c_float(renormalize_epsilon),
-            ],
-            stream,
-        )
+        gate_args = [
+            _pointer(logits),
+            _pointer(bias),
+            _null_or_pointer(bias_alt),
+            _null_or_pointer(input_ids),
+            ctypes.c_int32(input_ids is not None and input_ids.dtype == torch.int64),
+            ctypes.c_int64(alt_token_id),
+            _null_or_pointer(num_valid),
+            _pointer(weights),
+            _pointer(ids),
+            ctypes.c_float(routed_scaling_factor),
+            ctypes.c_float(renormalize_epsilon),
+        ]
         ctas = max_ctas(rows, self.top_k, self.experts)
-        permuted, record = self._route(ids, rows, ctas)
+        if self.serves_gate_route(rows, input_ids):
+            # one cluster of one CTA per row: the top-k, then CTA 0 builds the record
+            permuted = torch.empty((rows, self.top_k), dtype=torch.int32, device=device)
+            record = torch.empty(route_words(ctas), dtype=torch.int32, device=device)
+            _launch(
+                self.gate_route_kernel,
+                (rows, 1, 1),
+                gate_args
+                + [
+                    _pointer(permuted),
+                    _pointer(record),
+                    ctypes.c_int32(self.experts),
+                    ctypes.c_int32(self.expert_offset),
+                ],
+                stream,
+                cluster=(rows, 1, 1),
+            )
+        else:
+            _launch(self.gate_topk_kernel, (rows, 1, 1), gate_args, stream)
+            permuted, record = self._route(ids, rows, ctas)
         return self._gemms(x_quant, x_scale, record, ctas), weights, permuted, ids
+
+    def serves_gate_route(self, rows: int, input_ids=None) -> bool:
+        """Slot gate_route takes this call: 1-8 rows, and every launched row has a token
+        id when the router reads them (the fused kernel loads them unconditionally)."""
+        return (
+            self.gate_route_kernel is not None
+            and 1 <= rows <= MAX_ROWS
+            and (input_ids is None or input_ids.numel() >= rows)
+        )
 
     def _route(self, ids: torch.Tensor, rows: int, ctas: int):
         """The route kernel __call__ launches (route_wide.cu above 8 rows)."""
@@ -544,9 +660,10 @@ class RoutedExpertGemm:
             (rows * self.top_k * TILE, HIDDEN), dtype=torch.bfloat16, device=device
         )
         words = ctypes.c_int32(cta_words(ctas))
+        (gemm1, grid1), (gemm2, grid2) = self._gemm_launches(ctas, self.top_k)
         _launch(
-            self.kernels["gemm1"],
-            (GEMM1_UNITS, ctas, 1),
+            gemm1,
+            grid1,
             [
                 *self.gemm1_maps,
                 _pointer(x_quant),
@@ -560,8 +677,8 @@ class RoutedExpertGemm:
             stream,
         )
         _launch(
-            self.kernels["gemm2"],
-            (GEMM2_UNITS, ctas, 1),
+            gemm2,
+            grid2,
             [
                 *self.gemm2_maps,
                 _pointer(h_values),

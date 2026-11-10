@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Adapted from SGLang's python/sglang/kernels/ops/attention/dsv4/decode_attention_sm100_gluon.py (Apache-2.0).
-"""Native 16-head Blackwell (tcgen05) MMA layouts for paged V4-layout attention."""
+"""Native 16-head Blackwell (tcgen05) MMA layouts for paged V4-layout attention. ``HQ`` < 16
+real heads ride in the 16-column MMA: the missing query heads load as zero and their
+columns are never stored, so each real head's arithmetic is the 16-head kernel's."""
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
@@ -104,8 +106,10 @@ def partial_gluon(
     POS=None,
     ROPE_Q: gl.constexpr = False,
     KV_BEFORE_WAIT: gl.constexpr = False,
+    HQ: gl.constexpr = 16,
 ):
     gl.static_assert(SWAP_AB and H == 16 and (BT == 64 or BT == 128))
+    gl.static_assert(HQ == H or HQ == 8)
     if USE_GDC:
         if not KV_BEFORE_WAIT:
             # tl.extra.cuda.gdc_wait + gdc_launch_dependents; every input is read after the wait.
@@ -174,13 +178,20 @@ def partial_gluon(
             pack=1,
         )
     q_ptr = Q + b * QS + qh[:, None] * QH + qd[None, :]
-    q = gl.load(q_ptr)
+    if HQ < H:
+        q = gl.load(q_ptr, (qh < HQ)[:, None], 0.0)
+    else:
+        q = gl.load(q_ptr)
     if ROPE_Q:
         # The model's interleaved (real, imag) RoPE on the last 64 dims, from the
         # BF16 projection; explicit fmas match the q RoPE kernel's SASS bit for bit:
         # real = fma(xr, cos, -(xi * sin)), imag = fma(xr, sin, xi * cos).
         is_rope = qd >= 448
-        pair = gl.load(Q + b * QS + qh[:, None] * QH + (qd ^ 1)[None, :]).to(gl.float32)
+        pair_ptr = Q + b * QS + qh[:, None] * QH + (qd ^ 1)[None, :]
+        if HQ < H:
+            pair = gl.load(pair_ptr, (qh < HQ)[:, None], 0.0).to(gl.float32)
+        else:
+            pair = gl.load(pair_ptr).to(gl.float32)
         x = q.to(gl.float32)
         pos = gl.load(POS + b)
         f_idx = pos * 64 + ((qd - 448) // 2) * 2
@@ -252,8 +263,18 @@ def partial_gluon(
     value_hd = gl.convert_layout(value.permute((1, 0)), hd_layout)
     h = gl.arange(0, H, gl.SliceLayout(1, hd_layout))
     d = gl.arange(0, 512, gl.SliceLayout(0, hd_layout))
-    gl.store(PART + ((b * NT + t) * H + h[:, None]) * 512 + d[None, :], value_hd)
     stat_layout: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0])
     hs = gl.arange(0, H, stat_layout)
-    gl.store(MAX + (b * NT + t) * H + hs, gl.convert_layout(mx, stat_layout))
-    gl.store(SUM + (b * NT + t) * H + hs, gl.convert_layout(denom, stat_layout))
+    part_ptr = PART + ((b * NT + t) * HQ + h[:, None]) * 512 + d[None, :]
+    if HQ < H:
+        gl.store(part_ptr, value_hd, (h < HQ)[:, None])
+        gl.store(
+            MAX + (b * NT + t) * HQ + hs, gl.convert_layout(mx, stat_layout), hs < HQ
+        )
+        gl.store(
+            SUM + (b * NT + t) * HQ + hs, gl.convert_layout(denom, stat_layout), hs < HQ
+        )
+    else:
+        gl.store(part_ptr, value_hd)
+        gl.store(MAX + (b * NT + t) * H + hs, gl.convert_layout(mx, stat_layout))
+        gl.store(SUM + (b * NT + t) * H + hs, gl.convert_layout(denom, stat_layout))

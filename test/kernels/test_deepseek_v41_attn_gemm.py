@@ -12,9 +12,15 @@
 - The fused inverse RoPE + wo_a + MXFP8 kernel (src/wo_a_fused.cu) against SGLang's JIT
   build of the same device code, bit for bit, at representative row counts, int32 and
   int64 positions, the 64-head row stride and a packed one.
+- The fused wo_a on attention TP8's one local group (slot wo_a_g1): bit for bit the
+  first group of the two-group kernel (which is SGLang's) at every row tile, both scale
+  layouts, int32 / int64 positions, the 8-head output viewed packed and padded; and
+  within one MXFP8 step of SGLang's TP8 arm (inverse RoPE + BF16 einsum, quantized as
+  wo_b's input).
 - Swap-AB sparse attention with the query RoPE inside it and the KV-before-wait
   low-ratio path (PDL, narrow combine, combine entry trigger): bit for bit against
-  SGLang's q RoPE kernel followed by the plain launch, eager and replayed.
+  SGLang's q RoPE kernel followed by the plain launch, eager and replayed. At attention
+  TP8's 8 local heads (slot swapab_h8): bit for bit the 16-head kernel's first 8 heads.
 - The FlashMLA schedules the step head builds ahead (slot "sched_ahead"): bit for bit
   SGLang's lazy per-layer schedule (``_maybe_precompute_flashmla_sched_meta``) for every
   ratio, at a small and a large verify width, with padded lengths, eager and replayed.
@@ -480,6 +486,62 @@ def test_swapab_q_rope_and_kv_before_wait(b):
     _bitwise(out, expected)
 
 
+@needs_attention
+@pytest.mark.parametrize("b", [1, 6, 16, 24])
+def test_swapab_8_heads_are_the_16_head_kernels_first_8(b):
+    """TP8's 8 local heads ride in the 16-column MMA: the other heads' queries do not
+    reach the first 8 heads' outputs, so 8 heads equal the 16-head launch's first 8,
+    for each launch form the plugin uses (plain, PDL + RoPE in the kernel, KV before
+    the wait, graph replay), with the query packed [b, 8, 512] or a strided view."""
+    kv, _ = _make_cache(64)
+    extra, _ = _make_cache(16)
+    angles = torch.rand(70000, 32, device="cuda") * 6.3
+    freqs = torch.view_as_real(torch.polar(torch.ones_like(angles), angles)).flatten(-2)
+    torch.manual_seed(91 + b)
+    q16 = (torch.randn(b, 16, 512, device="cuda") * 3).to(torch.bfloat16)
+    positions = torch.randint(70000, (b,), device="cuda", dtype=torch.int64)
+    ids = torch.randint(0, 64 * 11, (b, 1, 128), device="cuda", dtype=torch.int32)
+    lengths = torch.randint(1, 129, (b,), device="cuda", dtype=torch.int32)
+    ei = torch.randint(0, 16 * 11, (b, 1, 512), device="cuda", dtype=torch.int32)
+    ei[:, :, -7:] = -1  # padded compressed indices
+    el = torch.randint(1, 513, (b,), device="cuda", dtype=torch.int32)
+    sink = torch.randn(16, device="cuda")
+    tail16 = (kv, ids, lengths, sink, extra, ei, el)
+    tail8 = (kv, ids, lengths, sink[:8].contiguous(), extra, ei, el)
+    for q8 in (q16[:, :8].contiguous(), q16[:, :8]):
+        for launch in (
+            PLAIN,
+            dict(PLUGIN, q_rope=(freqs, positions)),
+            dict(PLUGIN, q_rope=(freqs, positions), kv_before_wait=True),
+            dict(max_rows=24),
+        ):
+            want = swapab.swapab_attention(q16, *tail16, **launch)
+            got = swapab.swapab_attention(q8, *tail8, **launch)
+            assert got.shape == (b, 8, 512)
+            _bitwise(got, want[:, :8].contiguous())
+    # one-row sparse window, no compressed range (ratio 0 layers)
+    want = swapab.swapab_attention(q16, kv, ids, lengths, sink, **PLUGIN)
+    _bitwise(
+        swapab.swapab_attention(q16[:, :8], kv, ids, lengths, sink[:8], **PLUGIN),
+        want[:, :8].contiguous(),
+    )
+    q8 = q16[:, :8].contiguous()
+    launch = dict(PLUGIN, q_rope=(freqs, positions), kv_before_wait=True)
+    want = swapab.swapab_attention(q16, *tail16, **launch)[:, :8].contiguous()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        swapab.swapab_attention(q8, *tail8, **launch)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        out = swapab.swapab_attention(q8, *tail8, **launch)
+    out.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    _bitwise(out, want)
+
+
 # --------------------------------------------------------------------------- fused wo_a
 
 WO_A_SEEDS = (0, 1, 2)
@@ -591,6 +653,113 @@ def test_wo_a_fused_matches_sglang(rows, int64_positions, padded_heads):
                 ),
             )
     torch.cuda.synchronize()
+
+
+def _row_tile_scale_index(rows: int, groups: int) -> torch.Tensor:
+    """The byte offsets the kernel writes in the row-tile scale layout: blocks g of
+    rows [0, ceil(rows / 8) * 8) (the last tile's padding rows are written zero)."""
+    atoms = groups * wo_a.RANK // 128
+    r = torch.arange(-(-rows // 8) * 8)[:, None]
+    g = torch.arange(groups * wo_a.RANK // 32)[None, :]
+    return (((r >> 3) * atoms + (g >> 2)) * 512 + (r & 7) * 16 + (g & 3)).flatten()
+
+
+@needs_wo_a
+@pytest.mark.parametrize("row_tile_scales", [False, True])
+@pytest.mark.parametrize("padded_heads", [True, False])
+@pytest.mark.parametrize("int64_positions", [False, True])
+@pytest.mark.parametrize("rows", [1, 6, 8, 12, 16, 32, 48])
+def test_wo_a_one_group_is_the_first_of_two(
+    rows, int64_positions, padded_heads, row_tile_scales
+):
+    """TP8's 1 local group: each output column reads only its own group's 4096 inputs
+    in the same split-K order, so 1 group equals the 2-group kernel's first 1024 columns
+    and their scale blocks (the 2-group kernel is SGLang's, test above)."""
+    for seed in WO_A_SEEDS:
+        x2, w2, freqs, positions = _wo_a_inputs(
+            rows, seed, int64_positions, padded_heads
+        )
+        if padded_heads:
+            # TP8's attention output [T, 8, 512] as a strided slice of a padded buffer
+            x1 = x2[:, :1]
+        else:
+            # TP8's attention output [T, 8, 512], contiguous, viewed [T, 1, 4096]
+            x1 = x2[:, 0].contiguous().view(rows, 1, wo_a.GROUP_K)
+        w1 = w2[:1].contiguous()
+        codes2, scales2 = wo_a.fused_rope_wo_a(
+            x2, w2, freqs, positions, row_tile_scales=row_tile_scales
+        )
+        for early_trigger in (True, False):
+            codes1, scales1 = wo_a.fused_rope_wo_a(
+                x1,
+                w1,
+                freqs,
+                positions,
+                early_trigger=early_trigger,
+                row_tile_scales=row_tile_scales,
+            )
+            assert codes1.shape == (rows, wo_a.RANK)
+            assert torch.equal(
+                codes1.view(torch.uint8), codes2[:, : wo_a.RANK].view(torch.uint8)
+            )
+            if row_tile_scales:
+                assert scales1.numel() == -(-rows // 8) * wo_a.scale_bytes(1)
+                i1 = _row_tile_scale_index(rows, 1).cuda()
+                i2 = _row_tile_scale_index(rows, 2).cuda()
+                # group 0's blocks are the first 32 of each row's 64
+                i2 = i2.view(-1, 64)[:, :32].flatten()
+                assert torch.equal(scales1[i1], scales2[i2])
+            else:
+                assert scales1.numel() == wo_a.scale_bytes(1)
+                # the 128x4 swizzle puts blocks 0-31 of all 128 rows first
+                assert torch.equal(scales1, scales2[: wo_a.scale_bytes(1)])
+    torch.cuda.synchronize()
+
+
+@needs_wo_a
+@pytest.mark.parametrize("rows", [1, 6, 16])
+def test_wo_a_one_group_within_one_mxfp8_step_of_sglangs_tp8_arm(rows):
+    """SGLang at TP8 does not fuse: inverse RoPE in place, the BF16 einsum, then wo_b
+    quantizes its input (FlashInfer's MXFP8 quantize). The fused kernel rounds its FP32
+    split-K sum to BF16 the same way, so codes differ only where the two BF16 sums do:
+    at most one step of the block's coarsest quantum."""
+    try:
+        from sglang.kernels.ops.attention.dsv4 import fused_rope_inplace
+    except ImportError:
+        pytest.skip("this SGLang has no fused_rope_inplace")
+    if not _ll_gemm_ready():
+        pytest.skip("needs FlashInfer's MXFP8 quantize")
+    x2, w2, freqs, positions = _wo_a_inputs(rows, 0, True, False)
+    x = x2[:, 0].contiguous().view(rows, 8, HEAD_DIM)
+    w = w2[:1].contiguous()
+    codes, scales = wo_a.fused_rope_wo_a(x.view(rows, 1, -1), w, freqs, positions)
+    freqs_cis = torch.view_as_complex(freqs.view(freqs.shape[0], -1, 2).contiguous())
+    o = x.clone()
+    fused_rope_inplace(
+        o[..., -ROPE_DIM:], None, freqs_cis, positions=positions, inverse=True
+    )
+    y = torch.einsum("tgd,grd->tgr", o.view(rows, 1, -1), w).reshape(rows, -1)
+    ref_codes, ref_scales = mxfp8_ll.quantize(y)
+
+    def dequant(c, sf):
+        # 128x4 swizzle: block g of row r at (g // 4) * 512 + (r % 32) * 16 + (r // 32 % 4) * 4 + g % 4
+        r = torch.arange(rows, device="cuda")[:, None]
+        g = torch.arange(wo_a.RANK // 32, device="cuda")[None, :]
+        off = (g // 4) * 512 + (r % 32) * 16 + (r // 32 % 4) * 4 + g % 4
+        unit = torch.exp2(sf.reshape(-1)[off].float() - 127.0)
+        return c.float().view(rows, -1, 32) * unit[..., None], unit
+
+    got, unit_got = dequant(codes, scales)
+    want, unit_want = dequant(ref_codes.view(torch.float8_e4m3fn), ref_scales)
+    top = 32.0 * torch.maximum(unit_got, unit_want)[..., None]
+    steps = ((got - want).abs() / top).max().item()
+    moved = (
+        (codes.view(torch.uint8) != ref_codes.view(torch.uint8)).float().mean().item()
+    )
+    print(
+        f"WO_A_TP8_VS_SGLANG rows={rows} codes_moved={moved:.2e} max_top_steps={steps:.3f}"
+    )
+    assert steps <= 1.0, steps
 
 
 # ------------------------------------------------------------- FlashMLA schedules ahead

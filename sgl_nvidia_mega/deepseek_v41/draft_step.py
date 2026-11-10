@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sgl_nvidia_mega.deepseek_v41 import boundary, draft_attention, moe
+from sgl_nvidia_mega.deepseek_v41 import boundary, draft_attention, draft_slots, moe
 from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
 from sgl_nvidia_mega.deepseek_v41.draft import DraftProposal
 from sgl_nvidia_mega.deepseek_v41.runtime.state import StepState
@@ -100,6 +100,15 @@ class DraftDecode(DraftProposal):
             moe_bound = moe.routed.build_layers(
                 stages, get_parallel().tp_group, gate_topk="draft_gate" in slots
             )
+        # slot draft_hop: the posts on the plugin's Lamport hop where SGLang has no
+        # fused post (TP8 with EP2)
+        hop, self._hop_reason = None, "not requested"
+        if "draft_post" in slots and "draft_hop" in slots:
+            from sgl_nvidia_mega.deepseek_v41.boundary import draft_hop
+
+            hop, self._hop_reason = draft_hop.build(
+                stages, deadline_s=deadline_s, max_rows=DRAFT_MAX_ROWS
+            )
         self._bound = {
             # slot draft_post: SGLang's fused all-reduce + mHC posts on the stages;
             # draft_seam: each stage's MoE post also writes the next stage's input;
@@ -109,6 +118,7 @@ class DraftDecode(DraftProposal):
                 cross_layer="draft_post" in slots and "draft_seam" in slots,
                 mhc_fusions=True if "draft_post" in slots else None,
                 prenorm=_prenorm(slots),
+                draft_hop=hop,
             ),
             "moe": moe_bound,
         }
@@ -132,6 +142,8 @@ class DraftDecode(DraftProposal):
         self._attn = draft_attention.build(stages, slots) if binding is not None else {}
         if self._attn and torch.cuda.is_available():
             draft_attention.precompile(stages, self._attn, self.widths)
+        self.slot_states = draft_slots.states(self, slots)
+        draft_slots.warn_declined(self.slot_states)
 
     def _embed(self, input_ids):
         """``forward_embed``: the lookup broadcast to the hc streams, from the whole

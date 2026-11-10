@@ -212,6 +212,7 @@ DRAFT_SLOTS = frozenset(
         "draft_gate",
         "draft_tail",
         "draft_post",
+        "draft_hop",
         "draft_seam",
         "draft_qkv_a",
         "draft_qfront",

@@ -34,7 +34,6 @@ SGLANG_READS = {
         "freqs_cis",
         "alt_streams",
         "_multi_stream_bs_limit",
-        "_use_fast_kernel",
         "attn",
     ),
     "srt/models/deepseek_v4.py": (
@@ -191,7 +190,8 @@ def build(stages, slots: frozenset[str]) -> dict[int, Kernels]:
     kernels = {}
     for stage in stages:
         attn = stage.self_attn
-        if not attn._use_fast_kernel:
+        # SGLang since sgl-project/sglang#48399 always runs the fast kernels
+        if not getattr(attn, "_use_fast_kernel", True):
             continue
         fusable = "draft_qkv_a" in slots and not qkv_a_fusable(attn.wq_a, attn.wkv)
         wo_a = "draft_wo_a" in slots and wo_a_applies(attn)

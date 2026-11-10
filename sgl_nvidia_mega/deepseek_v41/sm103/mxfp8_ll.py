@@ -7,7 +7,6 @@ and wq_b at 1-64 rows, past the 8 rows FlashInfer's runner takes."""
 
 from __future__ import annotations
 
-import contextlib
 import importlib
 import logging
 from functools import lru_cache
@@ -66,35 +65,6 @@ def pinned_tactic(
     if not MAX_ROWS // 2 < rows <= MAX_ROWS:
         return None
     return PINNED_TACTICS.get((sm_version, n, k))
-
-
-@contextlib.contextmanager
-def pinned_tactics(sm_version: int):
-    """While tuning, FlashInfer's low-latency tactic list is the pinned tactic alone where
-    one applies, so the autotuner caches it under its usual key on every rank."""
-    ll_gemm = importlib.import_module(_GEMM_MODULE)
-    enumerate_tactics = ll_gemm.autotune_tactics
-
-    def autotune_tactics(problem_sizes_mnkl, *args, **kwargs):
-        tactics = enumerate_tactics(problem_sizes_mnkl, *args, **kwargs)
-        # The runner computes out.T, so the problem is (N, M, K, L).
-        n, rows, k, _ = problem_sizes_mnkl
-        pinned = pinned_tactic(sm_version=sm_version, n=n, k=k, rows=rows)
-        if pinned is None:
-            return tactics
-        if pinned not in tactics:
-            logger.warning(
-                f"NVIDIA megakernel: pinned low-latency MXFP8 tactic {pinned} is not "
-                f"offered for N={n} K={k}; autotuning that shape instead."
-            )
-            return tactics
-        return [pinned]
-
-    ll_gemm.autotune_tactics = autotune_tactics
-    try:
-        yield
-    finally:
-        ll_gemm.autotune_tactics = enumerate_tactics
 
 
 # --- wqkv_a / wq_b launched directly, 1-64 rows ------------------------------

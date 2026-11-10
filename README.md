@@ -162,7 +162,7 @@ The sampling and acceptance after the verify stay SGLang's own code. `gdn_prefil
 ### Requirements
 
 - An SGLang with the megakernels framework (`sglang.kernels.plugin_kernels.nvidia`, or `sglang.srt.megakernels` before sgl-project/sglang#45389; `--enable-nvidia-megakernel`); Qwen3.5 also needs `sglang.srt.kernel_plugins.nvidia.eagle_binding`
-- SGLang's CUDA 13 image: FlashInfer (its low-latency block-scaled GEMM as in 0.7.0 to 0.7.2), CuTe DSL (`nvidia-cutlass-dsl`) and the CUDA Python bindings
+- SGLang's CUDA 13 image: FlashInfer (its low-latency block-scaled GEMM as in 0.7.0 to 0.7.3), CuTe DSL (`nvidia-cutlass-dsl`) and the CUDA Python bindings
 - DeepSeek-V4.1-Flash: 4 x GB300, or 4 x 148-SM B300 (SM103) with `sm148` in `SGLANG_NVIDIA_MEGAKERNEL_SLOTS`
 - Qwen3.5: 8 x GB300, two trays of one NVLink domain
 - Kimi K3: 8 x GB300 (SM103, 152 SMs), BF16, context length up to 262144 within the

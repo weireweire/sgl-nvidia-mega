@@ -9,7 +9,8 @@ to ``DSparkAttention.forward``. Each further slot puts one of the target chain's
 in place of a stock op, on the rows the target serves with it:
 - draft_qfront: the q-LoRA RMSNorm + MXFP8 quant and the low-latency wq_b (1-48 rows);
 - draft_wo_a: the fused inverse RoPE + wo_a + MXFP8 for wo_b (1-48 rows);
-- draft_swapab: swap-AB attention on the 16 local heads, roping q as it loads (1-24);
+- draft_swapab: swap-AB attention on the 16 local heads (8 at TP8 with slot swapab_h8),
+  roping q as it loads (1-24);
 - draft_qkv_a: wq_a and wkv as one MXFP8 GEMM on SGLang's dispatch; draft_qkv_a_ll:
   that GEMM on the low-latency kernel at 1-8 rows;
 - draft_wo_b_ll: wo_b on the low-latency kernel at 1-8 rows, fed by draft_wo_a.
@@ -165,17 +166,20 @@ class Kernels(NamedTuple):
     kv_before_wait: bool = False
 
 
-def wo_a_applies(attn) -> bool:
-    """The draft's wo_a fits the fused kernel (the target's ``use_fused_wo_a`` shape)
-    and wo_b takes its MXFP8 rows."""
+def wo_a_applies(attn, one_group: bool = False) -> bool:
+    """The draft's wo_a fits the fused kernel (the target's ``use_fused_wo_a`` shape;
+    with ``one_group``, attention TP8's 1 local group too) and wo_b takes its MXFP8
+    rows."""
     from sglang.srt.models.deepseek_v4 import _fused_wo_a_arch_supported
 
+    groups = wo_a_kernel.GROUP_COUNTS if one_group else (wo_a_kernel.GROUPS,)
     return (
         attn.is_dsv41
         and _fused_wo_a_arch_supported()
         and attn.wo_a.weight.dtype == torch.bfloat16
         and attn.wo_a.weight.shape == (attn.n_local_groups * attn.o_lora_rank, 4096)
-        and (attn.n_local_groups, attn.o_lora_rank) == (2, 1024)
+        and attn.n_local_groups in groups
+        and attn.o_lora_rank == wo_a_kernel.RANK
         and attn.use_flashinfer_mxfp8_wo_b
     )
 
@@ -194,14 +198,15 @@ def build(stages, slots: frozenset[str]) -> dict[int, Kernels]:
         if not attn._use_fast_kernel:
             continue
         fusable = "draft_qkv_a" in slots and not qkv_a_fusable(attn.wq_a, attn.wkv)
-        wo_a = "draft_wo_a" in slots and wo_a_applies(attn)
+        wo_a = "draft_wo_a" in slots and wo_a_applies(attn, "wo_a_g1" in slots)
         kernels[stage.layer_id] = Kernels(
             # the chain's query kernels have no per-head norm
             qfront="draft_qfront" in slots
             and not attn.q_head_norm
             and chain.wq_b_ll_applies(attn),
             wo_a=wo_a,
-            swapab="draft_swapab" in slots and chain.swapab_applies(attn),
+            swapab="draft_swapab" in slots
+            and chain.swapab_applies(attn, heads8="swapab_h8" in slots),
             kv_before_wait="draft_swapab" in slots and "kv_before_wait" in slots,
             qkv_a=(
                 FusedQkvA(attn.wq_a, attn.wkv, ll="draft_qkv_a_ll" in slots)
@@ -250,7 +255,9 @@ def precompile(stages, kernels: dict[int, Kernels], widths) -> None:
                     row_tiles=r > mxfp8_ll.MAX_ROWS,
                 )
         if k.wo_a:
-            wo_a_kernel.precompile(min(max(rows), chain.WO_A_MAX_ROWS))
+            wo_a_kernel.precompile(
+                min(max(rows), chain.WO_A_MAX_ROWS), groups=attn.n_local_groups
+            )
 
 
 def forward(attn, x, positions, fb, *, kernels: Kernels, view):
@@ -394,7 +401,7 @@ def _wo_a(attn, o, positions, fb, fused: bool):
     # target takes the MXFP8 rows only without sequence parallelism
     if (
         fused
-        and attn.n_local_groups == 2
+        and attn.n_local_groups == attn.wo_a.weight.shape[0] // attn.o_lora_rank
         and not get_forward().sp_active
         and 0 < o.shape[0] <= chain.WO_A_MAX_ROWS
     ):

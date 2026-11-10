@@ -4,9 +4,11 @@
 place of single ops, each launched as a programmatic dependent (PDL) of the last.
 
 - q-LoRA RMSNorm + MXFP8 quant (1-48 rows), then wq_b on the low-latency MXFP8 GEMM;
-- at 1-24 rows the query keeps the 16 local heads, unroped, and the swap-AB sparse
-  attention ropes it as it loads it; its narrow combine triggers wo_a at entry;
-- the fused inverse RoPE + wo_a + MXFP8, which triggers wo_b at entry (1-48 rows).
+- at 1-24 rows the query keeps the 16 local heads (8 at attention TP8, slot
+  swapab_h8), unroped, and the swap-AB sparse attention ropes it as it loads it; its
+  narrow combine triggers wo_a at entry;
+- the fused inverse RoPE + wo_a + MXFP8, which triggers wo_b at entry (1-48 rows; on
+  TP8's one local group with slot wo_a_g1).
 At 25-48 rows the attention itself is SGLang's, on the 64-head query."""
 
 from __future__ import annotations
@@ -53,6 +55,10 @@ SGLANG_READS = {
         "compress_ratio",
         "use_fused_wo_a",
         "use_flashinfer_mxfp8_wo_b",
+        "_fused_wo_a_arch_supported",
+        "is_dsv41",
+        "wo_a_fp8",
+        "use_npu_arch35_mxfp8_wo_a",
         "_local_attn_sink",
         "q_head_norm",
         "softmax_scale",
@@ -89,6 +95,7 @@ SGLANG_READS = {
         "get_extra_key_bytes_per_token",
     ),
     "srt/runtime_context.py": ("get_forward", '"sp_active"'),
+    "srt/environ.py": ("envs", "SGLANG_DSV41_FUSED_WO_A"),
 }
 
 
@@ -101,13 +108,37 @@ def _ll_linear_applies(linear) -> bool:
     )
 
 
-def swapab_applies(attn) -> bool:
-    """The layer's query fits the swap-AB kernel: 16 local heads of 512, no head norm."""
+def swapab_applies(attn, heads8: bool = False) -> bool:
+    """The layer's query fits the swap-AB kernel: 16 local heads of 512 (or, with
+    ``heads8``, attention TP8's 8), no head norm."""
+    heads = (8, swapab.NUM_HEADS) if heads8 else (swapab.NUM_HEADS,)
     return (
         not attn.q_head_norm
-        and attn.n_local_heads == swapab.NUM_HEADS
+        and attn.n_local_heads in heads
         and attn.head_dim == swapab.HEAD_DIM
         and attn.softmax_scale == swapab.SOFTMAX_SCALE
+    )
+
+
+def fused_wo_a_applies(attn, one_group: bool = False) -> bool:
+    """The layer's wo_a runs the fused kernel: where SGLang's step fuses it (2 local
+    groups) or, with ``one_group``, on attention TP8's 1 local group under SGLang's
+    other conditions (SGLang's kernel takes 2 or 4 groups only and runs the einsum)."""
+    if attn.use_fused_wo_a or not one_group:
+        return attn.use_fused_wo_a
+    from sglang.srt.environ import envs
+    from sglang.srt.models.deepseek_v4 import _fused_wo_a_arch_supported
+
+    return (
+        attn.is_dsv41
+        and envs.SGLANG_DSV41_FUSED_WO_A.get()
+        and _fused_wo_a_arch_supported()
+        and not attn.wo_a_fp8
+        and not attn.use_npu_arch35_mxfp8_wo_a
+        and attn.wo_a.weight.dtype == torch.bfloat16
+        and attn.n_local_groups == 1
+        and attn.o_lora_rank == wo_a_kernel.RANK
+        and tuple(attn.wo_a.weight.shape) == (wo_a_kernel.RANK, wo_a_kernel.GROUP_K)
     )
 
 
@@ -391,8 +422,8 @@ def _note_kv_before_wait(model: str, rows: int, layer_id: int) -> None:
 def sparse_decode(
     attn, view, q, positions, freqs, *, kv_before_wait=False, model="target"
 ):
-    """Swap-AB on the 16 local heads in place of the backend's swap-AB / FlashMLA
-    choice; ropes ``q`` (unroped, [rows, 16, 512]) as it loads it. ``kv_before_wait``:
+    """Swap-AB on the 16 (or 8) local heads in place of the backend's swap-AB /
+    FlashMLA choice; ropes ``q`` (unroped, [rows, heads, 512]) as it loads it. ``kv_before_wait``:
     gather the KV before the PDL wait, only where every KV and index writer joined
     the step's stream before it (the low-ratio prepare)."""
     swa, swa_indices, swa_lengths, extra, extra_indices, extra_lengths = resolve_caches(
@@ -418,15 +449,18 @@ def sparse_decode(
     )
 
 
-def wo_a(attn, o, positions, fb, row_tiles: bool = False):
+def wo_a(attn, o, positions, fb, row_tiles: bool = False, *, fused=None):
     """The fused inverse RoPE + wo_a + MXFP8 with the early trigger, where SGLang's
-    own step fuses them; SGLang's arm otherwise. ``row_tiles`` (past 8 rows, for hop A's
+    own step fuses them (``fused``: the build's ``fused_wo_a_applies``, default
+    SGLang's choice); SGLang's arm otherwise. ``row_tiles`` (past 8 rows, for hop A's
     publishing wo_b only) writes the scales per 8-row tile: a ``RowTileMxfp8``."""
     from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
     from sglang.srt.runtime_context import get_forward
 
+    if fused is None:
+        fused = attn.use_fused_wo_a
     if not (
-        attn.use_fused_wo_a
+        fused
         and attn.use_flashinfer_mxfp8_wo_b
         and not get_forward().sp_active
         and 0 < o.shape[0] <= WO_A_MAX_ROWS
@@ -446,7 +480,9 @@ def wo_a(attn, o, positions, fb, row_tiles: bool = False):
     return Mxfp8SwizzledInput(codes, scales)
 
 
-def precompile(attn, widths, *, qkv_a_ll: bool = False) -> None:
+def precompile(
+    attn, widths, *, qkv_a_ll: bool = False, wo_a_one_group: bool = False
+) -> None:
     """Compile the chain's kernels that do not depend on the KV pool, for these widths:
     the low-latency wq_b GEMM, the fused wo_a, and the norm + quant (its row count and
     input row stride are compile-time constants). Called at build, before capture.
@@ -483,9 +519,10 @@ def precompile(attn, widths, *, qkv_a_ll: bool = False) -> None:
                 pdl=True,
                 row_tiles=r > mxfp8_ll.MAX_ROWS,
             )
-    if attn.use_fused_wo_a:
-        wo_a_kernel.precompile(min(max(rows), WO_A_MAX_ROWS))
+    if fused_wo_a_applies(attn, wo_a_one_group):
+        groups = attn.n_local_groups
+        wo_a_kernel.precompile(min(max(rows), WO_A_MAX_ROWS), groups=groups)
         # hop A's publishing wo_b past 8 rows reads row-tile scales
         tiled = [w for w in rows if mxfp8_ll.MAX_ROWS < w <= slot_plan.HOP_A_MAX_ROWS]
         if tiled and {"hop_a", "hop_a_batch2"} <= SLOTS:
-            wo_a_kernel.precompile(max(tiled), row_tile_scales=True)
+            wo_a_kernel.precompile(max(tiled), row_tile_scales=True, groups=groups)

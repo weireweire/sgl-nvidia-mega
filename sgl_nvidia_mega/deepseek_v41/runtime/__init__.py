@@ -95,13 +95,19 @@ DRAFT_SLOTS = frozenset(
 # mailbox, which measured +16 us on the batch-1 verify graph; target_lm_head: the
 # target's LM head on FlashInfer's low-M kernel at 1-8 rows, not bitwise; hop_b_quad_trigger:
 # hop B's finalize-publish lets the consumer launch right after its own wait, not at its end;
-# lm_head_pinned_tactic: the low-M LM heads on one fixed tactic per row count, untuned)
+# lm_head_pinned_tactic: the low-M LM heads on one fixed tactic per row count, untuned;
+# swapab_h8 / wo_a_g1: at attention TP8, swap-AB on the 8 local heads and the fused wo_a
+# on the 1 local group, target and draft, in place of SGLang's FlashMLA and einsum, which
+# TP8 runs (each bitwise to its TP4 kernel on the same heads / group, not to SGLang's
+# TP8 arm); no effect at TP4)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
     "target_lm_head",
     "hop_b_quad_trigger",
     "lm_head_pinned_tactic",
+    "swapab_h8",
+    "wo_a_g1",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -173,6 +179,8 @@ def slot_reasons() -> list[str]:
         ("draft_prenorm", "draft"),
         ("draft_qkv_a_ll", "draft_qkv_a"),
         ("draft_wo_b_ll", "draft_wo_a"),
+        ("swapab_h8", "attn"),
+        ("wo_a_g1", "attn"),
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")

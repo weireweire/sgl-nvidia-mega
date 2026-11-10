@@ -265,3 +265,169 @@ def linear(
         current_cu_stream(),
     )
     return out
+
+
+# --- the shared expert's gate_up with the SwiGLU (+ MXFP8) epilogue -----------
+# The same kernel and tactics as linear() on a gate_up weight interleaved by
+# swiglu_ll.interleave_gate_up; its epilogue writes SGLang's clamped SwiGLU of the
+# row, or with quant buffers that row's MXFP8 (swiglu_ll).
+
+
+class SwigluMxfp8Buffers(NamedTuple):
+    """Where the quantizing epilogue writes, at addresses compiled into the kernel:
+    E4M3 rows [max_rows, I] and their 128x4-swizzled UE8M0 scales."""
+
+    quant: torch.Tensor
+    scale: torch.Tensor
+
+
+@lru_cache(maxsize=None)
+def swiglu_mxfp8_buffers(
+    device_index: int, inter: int, max_rows: int
+) -> SwigluMxfp8Buffers:
+    """One pair per device and shape: every layer's shared expert writes it, then its
+    down_proj reads it, in order on the alternate stream."""
+    from sgl_nvidia_mega.deepseek_v41.sm103.swiglu_ll import scale_layout
+
+    padded_rows, padded_cols = scale_layout(max_rows, inter)
+    device = torch.device("cuda", device_index)
+    return SwigluMxfp8Buffers(
+        torch.zeros((max_rows, inter), dtype=torch.float8_e4m3fn, device=device),
+        torch.zeros(padded_rows * padded_cols, dtype=torch.uint8, device=device),
+    )
+
+
+_SWIGLU_COMPILED: dict = {}
+
+
+def _swiglu_compiled(
+    tactic: Tactic,
+    device: torch.device,
+    limit: int,
+    inter: int,
+    buffers: Optional[SwigluMxfp8Buffers],
+    early_release: bool = False,
+):
+    addresses = (
+        (0, 0)
+        if buffers is None
+        else (buffers.quant.data_ptr(), buffers.scale.data_ptr())
+    )
+    key = (device.index, tactic, limit, inter, addresses, early_release)
+    if key not in _SWIGLU_COMPILED:
+        import cutlass
+        import cutlass.cute as cute
+        from cutlass.cute.runtime import make_fake_stream
+
+        from sgl_nvidia_mega.deepseek_v41.sm103.swiglu_ll import (
+            SwigluLowLatencyBlockscaledGemmKernel,
+        )
+
+        cta_k, ab_stages, sfb_tmem_stages, split_k = tactic
+        gemm = SwigluLowLatencyBlockscaledGemmKernel(
+            limit=limit,
+            quant=buffers is not None,
+            inter=inter,
+            q_address=addresses[0],
+            sf_address=addresses[1],
+            early_release=early_release,
+            acc_dtype=cutlass.Float32,
+            mma_tiler_mnk=(128, 8, cta_k),
+            num_ab_stage=ab_stages,
+            num_sfb_tmem_stage=sfb_tmem_stages,
+            sf_vec_size=32,
+            use_pdl=True,
+            split_k=split_k,
+        )
+        e4m3, e8m0 = cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU
+        with torch.accelerator.device_index(device.index):
+            _SWIGLU_COMPILED[key] = cute.compile(
+                gemm,
+                _ptr(e4m3, 16, 16),
+                _ptr(e8m0, 32, 32),
+                _ptr(e4m3, 16, 16),
+                _ptr(e8m0, 16, 16),
+                _ptr(cutlass.BFloat16, 16, 16),
+                None,
+                None,
+                tuple(cutlass.Int32(v) for v in (128, 8, cta_k, 1)),
+                make_fake_stream(),
+            )
+    return _SWIGLU_COMPILED[key]
+
+
+def swiglu_tactic(device: torch.device, inter: int, k: int, rows: int) -> Tactic:
+    """The tactic :func:`linear` takes for the unfolded gate_up [2I, K] at ``rows``:
+    the fold keeps its K split and reduction order, so its output stays bitwise."""
+    major, minor = torch.cuda.get_device_capability(device)
+    return tuple(select_tactic(major * 10 + minor, 2 * inter, k, row_bucket(rows)))
+
+
+def precompile_swiglu(
+    weight: torch.Tensor,
+    rows: list[int],
+    limit: int,
+    inter: int,
+    buffers: Optional[SwigluMxfp8Buffers] = None,
+    early_release: bool = False,
+) -> None:
+    """Compile the SwiGLU kernels these row counts select; before graph capture."""
+    k = weight.shape[1]
+    for r in rows:
+        tactic = swiglu_tactic(weight.device, inter, k, r)
+        _swiglu_compiled(tactic, weight.device, limit, inter, buffers, early_release)
+
+
+def linear_swiglu(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    limit: int,
+    inter: int,
+    *,
+    buffers: Optional[SwigluMxfp8Buffers] = None,
+    out: Optional[torch.Tensor] = None,
+    early_release: bool = False,
+):
+    """SGLang's clamped SwiGLU of ``a @ gate_up.T`` for the gate_up [2I, K] that
+    ``weight`` holds interleaved and padded to whole tiles
+    (``swiglu_ll.interleave_gate_up``; ``limit``: the BF16 bits of the clamp): BF16
+    [M, I], or with ``buffers`` the (E4M3 [M, I], 128x4 UE8M0 scales) views
+    FlashInfer's ``mxfp8_quantize`` would return for it. Operands as :func:`linear`;
+    the tactic is the unfolded gate_up's (:func:`swiglu_tactic`)."""
+    from cutlass import BFloat16, Float8E4M3FN, Float8E8M0FNU, Int32
+
+    from sgl_nvidia_mega.common.sync import current_cu_stream
+    from sgl_nvidia_mega.deepseek_v41.sm103.swiglu_ll import scale_layout
+
+    rows, k = a.shape
+    n = weight.shape[0]
+    assert 0 < rows <= WIDE_MAX_ROWS and k % 128 == 0 and weight.shape[1] == k
+    assert n % 128 == 0 and 2 * inter <= n < 2 * inter + 128
+    assert a.is_contiguous() and weight.is_contiguous()
+    assert a_scale.numel() >= scale_bytes(rows, k)
+    tactic = swiglu_tactic(a.device, inter, k, rows)
+    if buffers is not None:
+        assert buffers.quant.shape[1] == inter and rows <= buffers.quant.shape[0]
+        c = buffers.quant
+    else:
+        if out is None:
+            out = torch.empty((rows, inter), dtype=torch.bfloat16, device=a.device)
+        assert out.shape == (rows, inter) and out.is_contiguous()
+        c = out
+    _swiglu_compiled(tactic, a.device, limit, inter, buffers, early_release)(
+        _ptr(Float8E4M3FN, weight.data_ptr(), 16),
+        _ptr(Float8E8M0FNU, weight_scale.data_ptr(), 32),
+        _ptr(Float8E4M3FN, a.data_ptr(), 16),
+        _ptr(Float8E8M0FNU, a_scale.data_ptr(), 16),
+        _ptr(BFloat16, c.data_ptr(), 16),
+        None,
+        None,
+        (Int32(n), Int32(rows), Int32(k), Int32(1)),
+        current_cu_stream(),
+    )
+    if buffers is None:
+        return out
+    padded_rows, padded_cols = scale_layout(rows, inter)
+    return buffers.quant[:rows], buffers.scale[: padded_rows * padded_cols]

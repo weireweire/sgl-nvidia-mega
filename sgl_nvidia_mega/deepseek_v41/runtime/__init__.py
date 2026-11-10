@@ -102,7 +102,11 @@ DRAFT_SLOTS = frozenset(
 # TP8 arm); no effect at TP4;
 # hop_mbar: the Lamport consumers' RMSNorm sums cross the cluster by st.async onto
 # mbarriers, not a cluster barrier, bitwise; hop_final_collapse: the last layer's hop B
-# also writes the head's mHC collapse, so the head runs only its RMSNorm, bitwise)
+# also writes the head's mHC collapse, so the head runs only its RMSNorm, bitwise;
+# shared_fold: slot shared_ll's gate_up epilogue writes the clamped SwiGLU, bitwise;
+# shared_fold_quant: it also writes down_proj's MXFP8 input, bitwise;
+# shared_fold_early_release: that GEMM releases down_proj's GEMM at its loads, as
+# FlashInfer's own gate_up does, not after its stores)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -113,6 +117,9 @@ OPT_IN_SLOTS = (
     "wo_a_g1",
     "hop_mbar",
     "hop_final_collapse",
+    "shared_fold",
+    "shared_fold_quant",
+    "shared_fold_early_release",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -154,6 +161,9 @@ def slot_reasons() -> list[str]:
     for slot, needs in (
         ("gate", "moe"),
         ("shared_ll", "moe"),
+        ("shared_fold", "shared_ll"),
+        ("shared_fold_quant", "shared_fold"),
+        ("shared_fold_early_release", "shared_fold_quant"),
         ("gate_wide", "gate"),
         ("hop_a_batch2", "hop_a"),
         ("attn_qkv_a", "attn"),

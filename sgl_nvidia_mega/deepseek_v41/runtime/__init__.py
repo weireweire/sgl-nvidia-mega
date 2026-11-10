@@ -92,6 +92,7 @@ DRAFT_SLOTS = frozenset(
         "draft_prenorm",
         "draft_qkv_a_ll",
         "draft_wo_b_ll",
+        "markov_pdl",
     }
 )
 # Slots that run only when listed (draft_embed: the draft's tokens from the target's
@@ -137,6 +138,8 @@ DRAFT_SLOTS = frozenset(
 # not wait for the SMs wq_b and the attention hold (bitwise); attn_index_weights_bf16:
 # the index head weights the BF16 scorers read made beside the head weights, not cast
 # before the logits (bitwise)
+# markov_pdl: the draft's Markov chain launched as a programmatic dependent of the draft
+# LM head, loading its head tiles before the wait, the anchors staged before the LM head)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -162,6 +165,7 @@ OPT_IN_SLOTS = (
     "attn_q_norm_gemm",
     "attn_index_q_first",
     "attn_index_weights_bf16",
+    "markov_pdl",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -227,6 +231,7 @@ def slot_reasons() -> list[str]:
         ("draft_lm_head", "markov"),
         ("target_lm_head_mxfp8", "target_lm_head"),
         ("draft_lm_head_mxfp8", "draft_lm_head"),
+        ("markov_pdl", "markov"),
         ("kv_before_wait", "attn"),
         ("draft_moe", "draft"),
         ("draft_gate", "draft_moe"),

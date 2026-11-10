@@ -235,6 +235,8 @@ def build_steps(
     if refusal:
         raise ValueError(refusal)
     cache_dtype = head.step_logits_dtype(torch.bfloat16)
+    from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
+
     # symmetric memory is invisible to memory_allocated
     free_before, _ = torch.cuda.mem_get_info()
     chain = markov.ShardedMarkov(
@@ -249,9 +251,8 @@ def build_steps(
         max_bs=max_bs,
         deadline_s=deadline_s,
         keeps_logits=not greedy_draft,
+        pdl="markov_pdl" in SLOTS,
     )
-    from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
-
     lm_head = DraftLmHead(
         lm.lm_head,
         low_m=low_m and low_m_lm_head_supported(),
@@ -369,6 +370,8 @@ class _Step:
         # as compute_base_logits: identity (with a 2-D assert) when the draft collapses
         # its hc streams in forward(), as V4.1's does
         hidden_states = self.lm.collapse_hc_head(hidden_states)
+        if self.chain.pdl:
+            self.chain.stage_anchor(anchor_tokens)
         x = self.lm.stages[-1].norm(hidden_states)
         base_logits = self.lm_head(x).view(self.bs, self.gamma, -1)
         if not self.greedy_draft:
@@ -379,6 +382,7 @@ class _Step:
             temperatures=self.temperatures,
             logits_cache=self.step_logits,
             draft_tokens=self.tokens,
+            anchor_staged=self.chain.pdl,
         )
         if not self.greedy_draft:
             # one block advances the counter once, as draft_markov_block does

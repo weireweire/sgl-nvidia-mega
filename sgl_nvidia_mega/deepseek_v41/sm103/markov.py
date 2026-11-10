@@ -230,9 +230,10 @@ def load_kernels(
 
 
 def _launch_cooperative(
-    kernel: _Kernel, ctas: int, arguments: list, stream: int
+    kernel: _Kernel, ctas: int, arguments: list, stream: int, pdl: bool = False
 ) -> None:
-    """Cooperative launch (co-resident grid); graph-capturable."""
+    """Cooperative launch (co-resident grid), with ``pdl`` also a programmatic dependent
+    of the stream's previous kernel; graph-capturable."""
     cu = _driver()
     addresses = [ctypes.addressof(argument) for argument in arguments]
     pointer_array = (ctypes.c_void_p * len(addresses))(*addresses)
@@ -245,7 +246,14 @@ def _launch_cooperative(
     attribute.id = cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_COOPERATIVE
     attribute.value.cooperative = 1
     config.attrs = [attribute]
-    config.numAttrs = 1
+    if pdl:
+        early = cu.CUlaunchAttribute()
+        early.id = (
+            cu.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION
+        )
+        early.value.programmaticStreamSerializationAllowed = 1
+        config.attrs = [attribute, early]
+    config.numAttrs = len(config.attrs)
     _check(
         cu.cuLaunchKernelEx(
             config, kernel.function, ctypes.addressof(pointer_array), 0
@@ -286,6 +294,7 @@ class ShardedMarkov:
         max_bs: int,
         deadline_s: float,
         keeps_logits: bool,
+        pdl: bool = False,
     ):
         device = embed_weight.device
         reason = unsupported_reason(
@@ -311,6 +320,9 @@ class ShardedMarkov:
         # without it the peer buffer has no staging for kept logits
         self.keeps_logits = keeps_logits
         self.timeout_ns = int(deadline_s * 1e9)
+        # slot markov_pdl: launched as a programmatic dependent of the LM head, the
+        # chain loads its head tiles while the LM head drains (stage_anchor first)
+        self.pdl = pdl
         self.vocab_local = vocab_size // world
         self.vocab_offset = rank * self.vocab_local
         self.embed_weight = embed_weight
@@ -471,6 +483,11 @@ class ShardedMarkov:
     def join_noise(self) -> None:
         torch.cuda.current_stream(self.device).wait_stream(self._noise_stream)
 
+    def stage_anchor(self, anchor_tokens: torch.Tensor) -> None:
+        """The anchors' copy ``sample(anchor_staged=True)`` reads; issued before the
+        LM head so the chain's launch follows the LM head directly."""
+        self.anchor[: anchor_tokens.shape[0]].copy_(anchor_tokens)
+
     def sample(
         self,
         *,
@@ -479,6 +496,7 @@ class ShardedMarkov:
         temperatures: torch.Tensor,
         logits_cache: Optional[torch.Tensor],
         draft_tokens: torch.Tensor,
+        anchor_staged: bool = False,
     ) -> None:
         """Draft tokens of every row into ``draft_tokens`` [rows, num_steps] and, when
         ``logits_cache`` [>= rows, num_steps, vocab] is given, the full-vocab step logits
@@ -489,7 +507,8 @@ class ShardedMarkov:
         assert temperatures.dtype == torch.float32
         assert draft_tokens.dtype == torch.int64 and draft_tokens.stride(1) == 1
         wide = rows > self.narrow_rows
-        self.anchor[:rows].copy_(anchor_tokens)
+        if not anchor_staged:
+            self.anchor[:rows].copy_(anchor_tokens)
         if logits_cache is None:
             idx_mapping, cache, stride0, stride1 = self.inert_rows, self.noise, 0, 0
         else:
@@ -538,5 +557,9 @@ class ShardedMarkov:
         ]
         stream = torch.cuda.current_stream(self.device).cuda_stream
         _launch_cooperative(
-            self._kernels[base_logits.dtype, name], self.ctas, arguments, stream
+            self._kernels[base_logits.dtype, name],
+            self.ctas,
+            arguments,
+            stream,
+            pdl=self.pdl,
         )

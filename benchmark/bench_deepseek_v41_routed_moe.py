@@ -603,6 +603,7 @@ class Bench:
                 ctypes.c_int32(ROWS),
                 ctypes.c_int32(TOP_K),
                 ctypes.c_int32(EXPERTS),
+                ctypes.c_int32(0),  # expert_offset: every expert local
             ],
             torch.cuda.current_stream().cuda_stream,
         )

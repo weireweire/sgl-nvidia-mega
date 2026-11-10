@@ -40,6 +40,8 @@ SGLANG_READS = {
     "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
         "Feature",
         "SPECULATIVE_DECODING",
+        "MULTI_NODE_TP",
+        "EXPERT_PARALLEL",
         "MegakernelSpec",
         "Numerics",
         "NumericsKind",
@@ -59,7 +61,16 @@ SGLANG_READS = {
         "dsv4_attn_backend",
         "enable_encoder_swa_bounded_replay",
         "startup_weight_load_mode",
+        "tp_size",
+        "ep_size",
+        "nnodes",
+        "moe_dp_size",
+        "ep_num_redundant_experts",
+        "init_expert_location",
+        "ep_dispatch_algorithm",
+        "ep_join_mode",
     ),
+    "srt/environ.py": ("SGLANG_SHARED_EXPERT_TP1",),
 }
 
 ARCHITECTURE = "DeepseekV4ForCausalLM"
@@ -107,9 +118,30 @@ def resident_blocks() -> int:
     return 148 if "sm148" in SLOTS else 152
 
 
+# (tp_size, ep_size) served: TP4 on one GB300 tray; attention TP8 + MoE TP4 x EP2 on
+# two trays of one NVLink domain (MoE-TP groups ranks 0-3 and 4-7, EP pairs i, i + 4)
+TOPOLOGIES = frozenset({(4, 1), (8, 2)})
+
+
+def topology_reasons(cfg) -> list[str]:
+    """Why the server's parallel layout is not one of ``TOPOLOGIES`` ([] when it is)."""
+    tp, ep = cfg.tp_size, cfg.ep_size or 1
+    reasons = []
+    if (tp, ep) not in TOPOLOGIES:
+        reasons.append(
+            f"tp_size {tp} with ep_size {ep}: DeepSeek-V4.1 serves TP4 without expert "
+            "parallelism, or TP8 with ep_size 2 (MoE TP4 x EP2)"
+        )
+    if tp == 4 and cfg.nnodes > 1:
+        reasons.append(f"TP4 serves one tray; nnodes is {cfg.nnodes}")
+    if (cfg.moe_dp_size or 1) != 1:
+        reasons.append(f"moe_dp_size {cfg.moe_dp_size} is not 1")
+    return reasons
+
+
 REQUIREMENTS = Requirements(
     isas=frozenset({"sm_103"}),
-    tp_sizes=frozenset({4}),
+    tp_sizes=frozenset(tp for tp, _ in TOPOLOGIES),
     resident_blocks=resident_blocks(),
     dtypes=frozenset({"bfloat16"}),
     decode_graph_backends=decode_graph_backends(),
@@ -125,11 +157,20 @@ REQUIREMENTS = Requirements(
         "enable_encoder_swa_bounded_replay": frozenset({False}),
         # the kernels read weights in place, after SGLang's last conversion
         "startup_weight_load_mode": frozenset({"serial"}),
+        # EP2: the trivial expert placement (rank r holds experts [r * 192, r * 192 +
+        # 192)), which the routed pair's expert window assumes
+        "ep_num_redundant_experts": frozenset({0}),
+        "init_expert_location": frozenset({"trivial"}),
+        "ep_dispatch_algorithm": frozenset({None}),
+        "ep_join_mode": frozenset({None}),
     },
     hf_config={**HF_CONFIG, "model_type": "deepseek_v41"},
     env={
         # the TP sync setting every measured launch ran with
         "SGLANG_SPEC_TP_SYNC": "rng,-dspark-accept-sample",
+        # the shared expert split over the whole TP group, as SGLang loads it by
+        # default: a TP partial the boundary's all-reduce sums (288 rows a rank at TP8)
+        "SGLANG_SHARED_EXPERT_TP1": False,
         # slot engram reads the per-rank host table SGLang builds only with these (no
         # per-table NUMA placement; SGLang's process membind, SGLANG_NUMA_BIND_V2, only)
         **(
@@ -255,7 +296,7 @@ def flashinfer_ll_gemm_digest():
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     from sgl_nvidia_mega.deepseek_v41 import runtime
 
-    reasons = toolchain_reasons() + runtime.slot_reasons()
+    reasons = topology_reasons(cfg) + toolchain_reasons() + runtime.slot_reasons()
     if cfg.cuda_graph_config.decode.backend == "disabled" and not eager_steps_allowed():
         reasons.append(
             "decode CUDA graphs are disabled: the eager forward is not supported yet; "
@@ -279,7 +320,14 @@ def _build(model, hf_config, ctx):
 SPEC = MegakernelSpec(
     name="DeepSeek-V4.1",
     requires=REQUIREMENTS,
-    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    # TP8 spans two trays; its MoE runs TP4 x EP2 (topology_reasons admits only that)
+    features=frozenset(
+        {
+            Feature.SPECULATIVE_DECODING,
+            Feature.MULTI_NODE_TP,
+            Feature.EXPERT_PARALLEL,
+        }
+    ),
     numerics=NUMERICS,
     # the two-shot slot alone covers the widths past the routed-expert pair
     max_rows=max_rows("two_shot" in SLOTS),

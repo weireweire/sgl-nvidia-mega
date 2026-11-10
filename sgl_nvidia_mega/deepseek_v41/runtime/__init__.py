@@ -377,8 +377,18 @@ def build(model, ctx):
             for a in bound["attention"].values()
         ),
     }
+    # kv_before_wait only moves swap-AB's KV gather: with no low-ratio layer on
+    # swap-AB (attention TP8 without slot swapab_h8) it has nothing to serve, which is
+    # not a failed build; it is left off the active slots
+    moot = (
+        set()
+        if any(a.swapab and a.low_ratio for a in bound["attention"].values())
+        else {"kv_before_wait"}
+    )
     # every package's build agrees across ranks, so this raises on every rank alike
-    missing = sorted(name for name in SLOTS & built.keys() if not built[name])
+    missing = sorted(
+        name for name in (SLOTS & built.keys()) - moot if not built[name]
+    )
     if missing:
         raise RuntimeError(
             f"NVIDIA megakernel: requested slots {missing} built at no width "

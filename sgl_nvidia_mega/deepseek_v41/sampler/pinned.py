@@ -19,7 +19,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 # (SM version, N, K, rows) -> (FlashInfer runner class, tactic); rows absent here, or a
-# tactic FlashInfer no longer offers, run FlashInfer's default (its first runner, tactic
+# tactic the runner no longer runs, run FlashInfer's default (its first runner, tactic
 # -1), which is fixed per shape too. GB300 TP4 shard (N 32320, K 5120), CUDA graph
 # replay: the fastest offered tactic per row count, 0.4-1.4 us under the default.
 _DIRECT, _WARP = "CuteDSLDirectBf16Runner", "CuteDSLWarpSplitKBf16Runner"
@@ -76,8 +76,7 @@ def _choice(sm_version: int, n: int, k: int, rows: int, device: torch.device):
                 _inputs(x, weight_t, out)
             ):
                 continue
-            offered = runner.get_valid_tactics(_inputs(x, weight_t, out), None)
-            if tactic in [tuple(t) for t in offered]:
+            if _runs(runner, _inputs(x, weight_t, out), tactic):
                 return runner, tactic
         logger.warning(
             "NVIDIA megakernel: pinned LM-head tactic %s %s not offered at %d rows; "
@@ -87,6 +86,15 @@ def _choice(sm_version: int, n: int, k: int, rows: int, device: torch.device):
             rows,
         )
     return runners[0], -1
+
+
+def _runs(runner, inputs: list, tactic: tuple[int, ...]) -> bool:
+    """Whether the runner offers the tactic, or (FlashInfer 0.7.3 prunes its warp split-K
+    autotune list) its own tactic check accepts it."""
+    if tactic in [tuple(t) for t in runner.get_valid_tactics(inputs, None)]:
+        return True
+    compatible = getattr(runner, "is_tactic_compatible", None)
+    return compatible is not None and compatible(inputs, tactic)
 
 
 def pinned_mm(x: torch.Tensor, weight_t: torch.Tensor) -> torch.Tensor:

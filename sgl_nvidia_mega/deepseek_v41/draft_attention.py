@@ -35,7 +35,8 @@ SGLANG_READS = {
         "freqs_cis",
         "alt_streams",
         "_multi_stream_bs_limit",
-        "_use_fast_kernel",
+        # SGLang after 858073e4 runs the fast kernels unconditionally on CUDA
+        "_use_fast_kernel|fused_q_norm_rope",
         "attn",
     ),
     "srt/models/deepseek_v4.py": (
@@ -195,7 +196,7 @@ def build(stages, slots: frozenset[str]) -> dict[int, Kernels]:
     kernels = {}
     for stage in stages:
         attn = stage.self_attn
-        if not attn._use_fast_kernel:
+        if not getattr(attn, "_use_fast_kernel", True):
             continue
         fusable = "draft_qkv_a" in slots and not qkv_a_fusable(attn.wq_a, attn.wkv)
         wo_a = "draft_wo_a" in slots and wo_a_applies(attn, "wo_a_g1" in slots)

@@ -102,3 +102,15 @@ def test_the_slot_is_opt_in_and_needs_a_low_m_head(monkeypatch):
         runtime, "SLOTS", frozenset({"lm_head_pinned_tactic", "target_lm_head"})
     )
     assert not any("lm_head_pinned_tactic" in r for r in runtime.slot_reasons())
+
+
+def test_a_pin_pruned_from_the_autotune_list_still_runs_if_the_runner_accepts_it(fi):
+    # FlashInfer 0.7.3 prunes the warp split-K autotune list; the kernel still runs the pin
+    warp, _ = fi
+    warp.is_tactic_compatible = lambda inputs, tactic: tactic == (16, 8, 256, 4, 2)
+    pinned.PINNED_TACTICS[(103, N, K, 6)] = ("WarpSplitK", (16, 8, 256, 4, 2))
+    pinned.PINNED_TACTICS[(103, N, K, 8)] = ("WarpSplitK", (16, 8, 128, 12, 1))
+    w = torch.randn(N, K).to(torch.bfloat16)
+    for rows in (6, 8):
+        pinned.pinned_mm(torch.randn(rows, K).to(torch.bfloat16), w.t())
+    assert warp.calls == [(6, (16, 8, 256, 4, 2)), (8, -1)]

@@ -35,7 +35,15 @@ def multi_stream(attn, x, positions, fb, view, q_out, x_quant, q_ops=ops):
     if attn.fuse_wqa_wkv:
         qkv_a = q_ops.qkv_a(attn, x_linear)
         qkv_a_ready = current.record_event()
-    q_lora, q_for_wqb = q_ops.compute_q_a(attn, x_linear, qkv_a)
+    # slot attn_q_norm_gemm: no indexer reads q_lora, so wq_b may norm it itself
+    if (
+        attn.indexer is None
+        and getattr(q_ops, "q_norm_gemm", False)
+        and q_ops.defers_norm(attn, x.shape[0])
+    ):
+        q_lora, q_for_wqb = q_ops.compute_q_a(attn, x_linear, qkv_a, defer=True)
+    else:
+        q_lora, q_for_wqb = q_ops.compute_q_a(attn, x_linear, qkv_a)
     q_lora_ready = current.record_event()
     if attn.indexer is not None:
         with torch.cuda.stream(stream_indexer):
@@ -73,11 +81,14 @@ def low_ratio(attn, x, positions, fb, view, q_out, x_quant, q_ops=ops):
     # slot attn_indexer: the index head weights read only x, so the second stream forks
     # here; the index query joins it once q_lora is quantized
     plugin_index = _plugin_index(attn, q_ops, x, fb, view)
+    weights_bf16 = None
     if plugin_index is not None:
         stream_query = attn.alt_streams[1]
         stream_query.wait_stream(current)
         with torch.cuda.stream(stream_query):
             head_weights = plugin_index.head_weights(attn, x)
+            if getattr(q_ops, "index_weights_bf16", False):
+                weights_bf16 = plugin_index.weights_bf16(attn, head_weights)
     qkv_a = None
     if attn.fuse_wqa_wkv:
         qkv_a = q_ops.qkv_a(attn, x_linear)
@@ -92,20 +103,54 @@ def low_ratio(attn, x, positions, fb, view, q_out, x_quant, q_ops=ops):
                 run_indexer=False,
             )
     stream_kv.wait_stream(current)
-    q_lora, q_for_wqb = q_ops.compute_q_a(attn, x_linear, qkv_a)
+    # slot attn_index_q_first: the index query's wq_b ahead of wq_b on this stream, so
+    # it never waits for the SMs wq_b and the attention hold
+    first = plugin_index is not None and getattr(q_ops, "index_q_first", False)
+    index_wq_b = attn.indexer.wq_b if first else None
+    # slot attn_q_norm_gemm: only where no indexer reads q_lora (fused into the index
+    # query's wq_b instead, the norm delays the index chain: slower per step)
+    defer = (
+        attn.indexer is None
+        and getattr(q_ops, "q_norm_gemm", False)
+        and q_ops.defers_norm(attn, x.shape[0])
+    )
+    q_lora, q_for_wqb = (
+        q_ops.compute_q_a(attn, x_linear, qkv_a, defer=True)
+        if defer
+        else q_ops.compute_q_a(attn, x_linear, qkv_a)
+    )
     # the index query on the second stream, beside the query chain
     if plugin_index is not None:
-        stream_query.wait_stream(current)
         req, pos = indexer.request_rows(view, fb, x.shape[0])
-        with torch.cuda.stream(stream_query):
-            index_q = plugin_index.query(
-                attn, q_for_wqb, head_weights, indexer.positions_for(pos, positions)
+        pos = indexer.positions_for(pos, positions)
+        if first:
+            # the index chain stays on this stream (PDL launches overlap each hop); wq_b
+            # moves to the second stream, off it. Each hop reads after its PDL wait.
+            index_raw, q_for_wqb = q_ops.index_q_b(
+                attn, q_for_wqb, index_wq_b.weight, index_wq_b.weight_scale_inv_swizzled
             )
+            quant_ready = current.record_event()
+            current.wait_stream(stream_query)  # the head weights
+            index_q = plugin_index.pack(
+                attn, index_raw, head_weights, pos, weights_bf16
+            )
+            stream_query.wait_event(quant_ready)
+            with torch.cuda.stream(stream_query):
+                q = q_ops.compute_q_b(attn, q_for_wqb, positions, q_out)
+            q.record_stream(current)
+        else:
+            stream_query.wait_stream(current)
+            with torch.cuda.stream(stream_query):
+                index_q = plugin_index.query(
+                    attn, q_for_wqb, head_weights, pos, weights_bf16
+                )
         for t in index_q:
-            t.record_stream(stream_sources)
+            if t is not None:
+                t.record_stream(stream_sources)
     if attn.indexer is not None:
         stream_sources.wait_stream(current)
-    q = q_ops.compute_q_b(attn, q_for_wqb, positions, q_out)
+    if not first:
+        q = q_ops.compute_q_b(attn, q_for_wqb, positions, q_out)
 
     def sglang_index():
         view.low_ratio_sources(
@@ -123,7 +168,8 @@ def low_ratio(attn, x, positions, fb, view, q_out, x_quant, q_ops=ops):
             if plugin_index is None:
                 sglang_index()
             else:
-                stream_sources.wait_stream(stream_query)
+                if not first:
+                    stream_sources.wait_stream(stream_query)
                 plugin_index.topk(attn, index_q, req, view)
                 if plugin_index.check:
                     plugin_index.compare(attn, view, sglang_index)

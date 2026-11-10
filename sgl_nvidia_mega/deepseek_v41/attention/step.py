@@ -159,6 +159,9 @@ class AttentionStep:
         index_after_wait: bool = False,
         swapab_h8: bool = False,
         wo_a_g1: bool = False,
+        q_norm_gemm: bool = False,
+        index_q_first: bool = False,
+        index_weights_bf16: bool = False,
     ):
         self.attn = attn
         # swap-AB gathers the KV before its PDL wait on the low-ratio prepare (slot
@@ -180,6 +183,9 @@ class AttentionStep:
                     qkv_a_ll=qkv_a_ll,
                     qkv_a_bf16=qkv_a_bf16,
                     index_q_mxfp8_in=index_q_mxfp8_in,
+                    q_norm_gemm=q_norm_gemm,
+                    index_q_first=index_q_first,
+                    index_weights_bf16=index_weights_bf16,
                 )
                 for rope in (False, True)
             )

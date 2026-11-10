@@ -23,6 +23,14 @@ before it writes the selection, which the attention reads before its PDL wait);
 selection after its wait); ``safe`` every selection after the wait. The compressor is
 not modeled (its index-K and compressed-KV caches are static here).
 
+Flags after ``+`` on an arm (e.g. ``base+w+i+n``): ``w`` slot attn_index_weights_bf16
+(the BF16 head weights on the query stream before q_lora, no cast before the logits);
+``i`` slot attn_index_q_first (the index query's wq_b and its RoPE + pack on the main
+stream, wq_b on the query stream); ``n`` slot attn_q_norm_gemm (q_norm + quant inside wq_b's
+GEMM in the layers without an indexer); ``N`` that, and with ``i`` inside the index
+query's wq_b too (not in the slot: it measured slower); ``p`` the query and sources
+streams at the highest priority.
+
 Reports, per layer kind, the median over layers and replays (torch profiler, CUPTI) of
 each kernel's stream, start and end from the layer's wqkv_a start, and the layer
 period (next layer's wqkv_a start); and us per step from plain graph replays, arms
@@ -45,7 +53,7 @@ import torch
 from sgl_nvidia_mega.deepseek_v41.attention import chain as chain_mod
 from sgl_nvidia_mega.deepseek_v41.attention import indexer as indexer_mod
 from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
-from sgl_nvidia_mega.deepseek_v41.sm103.attention import swapab, wo_a
+from sgl_nvidia_mega.deepseek_v41.sm103.attention import q_norm_gemm, swapab, wo_a
 from sgl_nvidia_mega.deepseek_v41.sm103.attention.q_norm_quant import rmsnorm_mxfp8
 
 HIDDEN, Q_LORA, KV_DIM = 5120, 1280, 512
@@ -95,10 +103,9 @@ class Layer:
         self.swa = _kv_cache(4)
         # the selection's slots index the compressed cache as they index the index-K pool
         self.extra = _kv_cache(-(-pages * IPAGE // PAGE))
-        self.ids = (
-            torch.randint(0, 3 * PAGE, (rows, 1, 1), device="cuda", dtype=torch.int32)
-            + torch.arange(SWA, device="cuda", dtype=torch.int32)
-        )
+        self.ids = torch.randint(
+            0, 3 * PAGE, (rows, 1, 1), device="cuda", dtype=torch.int32
+        ) + torch.arange(SWA, device="cuda", dtype=torch.int32)
         self.sink = torch.randn(heads, device="cuda")
         self.kv_out = torch.empty(rows, KV_DIM, dtype=torch.bfloat16, device="cuda")
         self.attn = None
@@ -169,16 +176,22 @@ class Step:
             kv_pool=SimpleNamespace(pool=None),
         )
         caches = {L.attn.layer_id: L.k_cache for L in self.layers if L.attn is not None}
-        scoring.get_index_k_cache = lambda token_to_kv_pool, layer_id, page_size: caches[
-            layer_id
-        ]
+        scoring.get_index_k_cache = lambda token_to_kv_pool, layer_id, page_size: (
+            caches[layer_id]
+        )
         self.req = torch.zeros(rows, dtype=torch.int32, device="cuda")
         self.indexer = indexer_mod.StepIndexer(
             SimpleNamespace(candidate_topk_blocks=TOPK_BLOCKS), fused=not stock_consumer
         )
         self.lengths = torch.full((rows,), SWA, device="cuda", dtype=torch.int32)
         self.el = torch.full((rows,), TOPK, device="cuda", dtype=torch.int32)
-        self.s_kv, self.s_query, self.s_sources = (torch.cuda.Stream() for _ in range(3))
+        self.s_kv, self.s_query, self.s_sources = (
+            torch.cuda.Stream() for _ in range(3)
+        )
+        high = torch.cuda.Stream.priority_range()[1]
+        self.s_query_hi, self.s_sources_hi = (
+            torch.cuda.Stream(priority=high) for _ in range(2)
+        )
         self.consumer = mxfp8_ll.WQ_B_TP8 if heads == 8 else None
         L0 = self.layers[0]
         mxfp8_ll.precompile(L0.wq_b[0], [rows], self.consumer)
@@ -187,6 +200,31 @@ class Step:
         first_index = next(L for L in self.layers if L.attn is not None)
         mxfp8_ll.precompile(first_index.attn.indexer.wq_b.weight, [rows])
         wo_a.precompile(rows, groups=heads // 8)
+        if rows <= q_norm_gemm.MAX_ROWS:
+            q_norm_gemm.precompile(L0.wq_b[0], [rows], EPS, consumer=self.consumer)
+            q_norm_gemm.precompile(
+                first_index.attn.indexer.wq_b.weight, [rows], EPS, write_quant=True
+            )
+
+    def gemm_names(self):
+        """Each low-latency GEMM's launch grid -> its name (the tactics' split-K)."""
+        major, minor = torch.cuda.get_device_capability()
+        sm = major * 10 + minor
+        L0 = self.layers[0]
+        first_index = next(L for L in self.layers if L.attn is not None)
+        names = {}
+        for name, w, consumer in (
+            ("index_wq_b", first_index.attn.indexer.wq_b.weight, None),
+            ("wo_b", L0.wo_b[0], None),
+            ("wqkv_a", L0.wqkv[0], None),
+            ("wq_b", L0.wq_b[0], self.consumer),
+        ):
+            n, k = w.shape
+            split = mxfp8_ll.select_tactic(
+                sm, n, k, mxfp8_ll.row_bucket(self.rows), consumer
+            )[3]
+            names[(n // 128, -(-self.rows // 8), split)] = name
+        return names
 
     def indexer_head_weights(self, L):
         return L.attn.indexer.head_weights_raw(self.x_bf16)
@@ -207,35 +245,88 @@ class Step:
         # the Full layers and the source after the wait); safe: every selection after it
         after_wait = arm.startswith("safe")
         stock_after_wait = after_wait or arm.startswith("stock_safe")
+        flags = set(arm.split("+")[1:])
         rows, x = self.rows, self.x
         cur = torch.cuda.current_stream()
+        s_query = self.s_query_hi if "p" in flags else self.s_query
+        s_sources = self.s_sources_hi if "p" in flags else self.s_sources
         self.indexer._meta = None
-        self.indexer.serves(self.view, rows, SimpleNamespace(forward_mode=SimpleNamespace(is_target_verify=lambda: True)))
+        self.indexer.serves(
+            self.view,
+            rows,
+            SimpleNamespace(
+                forward_mode=SimpleNamespace(is_target_verify=lambda: True)
+            ),
+        )
         outs = []
         for L in self.layers:
             index = L.attn is not None
             hw = L.head_weights if index else None
+            first = index and "i" in flags
+            # n: layers without an indexer (the slot); N: also the index query's
+            fused = rows <= q_norm_gemm.MAX_ROWS and (
+                (not index and ("n" in flags or "N" in flags))
+                or (first and "N" in flags)
+            )
+            wbf16 = None
+            if index:
+                # the model forks the query stream for the head weights before wqkv_a
+                s_query.wait_stream(cur)
+                if "w" in flags:
+                    with torch.cuda.stream(s_query):
+                        wbf16 = self.indexer.weights_bf16(L.attn, hw)
             qkv = mxfp8_ll.linear(x[0], x[1].reshape(-1), *L.wqkv)
             self.s_kv.wait_stream(cur)
-            _, q8, s8 = rmsnorm_mxfp8(qkv[:, :Q_LORA], L.q_norm, EPS, pdl=True)
+            q8 = s8 = None
+            if not fused:
+                _, q8, s8 = rmsnorm_mxfp8(qkv[:, :Q_LORA], L.q_norm, EPS, pdl=True)
             if index:
-                self.s_query.wait_stream(cur)
-                with torch.cuda.stream(self.s_query):
-                    iq = self.indexer.query(
-                        L.attn, chain_mod.Mxfp8Rows(q8, s8), hw, self.pos
-                    )
-                self.s_sources.wait_stream(cur)
-            q = mxfp8_ll.linear(q8, s8, *L.wq_b, consumer=self.consumer)
+                wq = L.attn.indexer.wq_b
+                if first:
+                    if fused:
+                        raw, qr = q_norm_gemm.q_norm_linear(
+                            qkv[:, :Q_LORA],
+                            L.q_norm,
+                            EPS,
+                            wq.weight,
+                            wq.weight_scale_inv_swizzled,
+                            write_quant=True,
+                        )
+                        q8, s8 = qr.quant, qr.scale
+                    else:
+                        raw = mxfp8_ll.linear(
+                            q8, s8, wq.weight, wq.weight_scale_inv_swizzled
+                        )
+                    quant_ready = cur.record_event()
+                    cur.wait_stream(s_query)
+                    iq = self.indexer.pack(L.attn, raw, hw, self.pos, wbf16)
+                    s_query.wait_event(quant_ready)
+                    with torch.cuda.stream(s_query):
+                        q = mxfp8_ll.linear(q8, s8, *L.wq_b, consumer=self.consumer)
+                else:
+                    s_query.wait_stream(cur)
+                    with torch.cuda.stream(s_query):
+                        iq = self.indexer.query(
+                            L.attn, chain_mod.Mxfp8Rows(q8, s8), hw, self.pos, wbf16
+                        )
+                s_sources.wait_stream(cur)
+            if fused and not index:
+                q = q_norm_gemm.q_norm_linear(
+                    qkv[:, :Q_LORA], L.q_norm, EPS, *L.wq_b, consumer=self.consumer
+                )
+            elif not first:
+                q = mxfp8_ll.linear(q8, s8, *L.wq_b, consumer=self.consumer)
             if index:
-                with torch.cuda.stream(self.s_sources):
-                    self.s_sources.wait_stream(self.s_query)
+                with torch.cuda.stream(s_sources):
+                    if not first:
+                        s_sources.wait_stream(s_query)
                     self.indexer.topk(L.attn, iq, self.req, self.view)
             with torch.cuda.stream(self.s_kv):
                 L.kv_out.copy_(qkv[:, Q_LORA:])
             cur.wait_stream(self.s_kv)
             if index:
-                cur.wait_stream(self.s_sources)
-                cur.wait_stream(self.s_query)
+                cur.wait_stream(s_sources)
+                cur.wait_stream(s_query)
             o = swapab.swapab_attention(
                 q.view(rows, 1, self.heads, 512),
                 L.swa,
@@ -251,7 +342,8 @@ class Step:
                 q_rope=(self.freqs, self.pos),
                 kv_before_wait=True,
                 combine_entry_trigger=True,
-                extra_after_wait=index and (after_wait or (stock_after_wait and L.kind != "C")),
+                extra_after_wait=index
+                and (after_wait or (stock_after_wait and L.kind != "C")),
             )
             outs.append(o)
             groups = self.heads // 8
@@ -288,6 +380,7 @@ def _replay_us(g, replays):
 
 
 SHORT = (
+    ("QNormLowLatencyGemm", "qngemm"),
     ("LowLatencyBlockscaledGemm", "llgemm"),
     ("_rmsnorm_mxfp8", "q_norm"),
     ("partial_gluon", "attn"),
@@ -330,12 +423,19 @@ def profile(step, g, replays):
         )
         for e in ks
     ]
-    # the low-latency GEMMs by grid: the first layer (a reuse layer) runs wqkv_a, wq_b
-    # and wo_b in that order; any other grid is the indexer's wq_b
-    first = [k for k in seq if k[0] == "llgemm"][:3]
-    names = dict(zip((k[3] for k in first), ("wqkv_a", "wq_b", "wo_b")))
+    # the low-latency GEMMs by grid (N / 128 tiles, row tiles, split-K)
+    names = step.gemm_names()
     seq = [
-        (names.get(g, "index_wq_b") if n == "llgemm" else n, s, e, g)
+        (
+            names.get(g, "llgemm?")
+            if n == "llgemm"
+            else "qn_" + names.get(g, "?")
+            if n == "qngemm"
+            else n,
+            s,
+            e,
+            g,
+        )
         for n, s, e, g in seq
     ]
     starts = [s for n, s, e, g in seq if n == "wqkv_a"]
@@ -416,7 +516,9 @@ def main():
                             got[arm] = [o.clone() for o in graphs[arm][1]]
                             for i, o in enumerate(got[arm]):
                                 if arm in prev and not torch.equal(o, prev[arm][i]):
-                                    own[(arm, kinds[i])] = own.get((arm, kinds[i]), 0) + 1
+                                    own[(arm, kinds[i])] = (
+                                        own.get((arm, kinds[i]), 0) + 1
+                                    )
                             prev[arm] = got[arm]
                         for arm in arms[1:]:
                             for i, (u, v) in enumerate(zip(got[arms[0]], got[arm])):

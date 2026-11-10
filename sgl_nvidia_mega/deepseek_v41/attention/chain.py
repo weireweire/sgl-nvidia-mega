@@ -21,7 +21,7 @@ import torch
 from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
 from sgl_nvidia_mega.deepseek_v41.attention import ops
 from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
-from sgl_nvidia_mega.deepseek_v41.sm103.attention import swapab
+from sgl_nvidia_mega.deepseek_v41.sm103.attention import q_norm_gemm, swapab
 from sgl_nvidia_mega.deepseek_v41.sm103.attention import wo_a as wo_a_kernel
 from sgl_nvidia_mega.deepseek_v41.sm103.attention.q_norm_quant import rmsnorm_mxfp8
 
@@ -198,6 +198,13 @@ class Mxfp8Rows(NamedTuple):
     scale: torch.Tensor
 
 
+class DeferredNorm(NamedTuple):
+    """Slot attn_q_norm_gemm: q_lora not yet normed, for wq_b to norm and quantize in
+    its own launch (``sm103/attention/q_norm_gemm``, ``ChainOps.compute_q_b``)."""
+
+    q_lora: torch.Tensor
+
+
 def qkv_a_ll_applies(attn) -> bool:
     """wqkv_a runs on the low-latency GEMM at 1-8 rows, on the boundary's MXFP8 input."""
     return (
@@ -257,6 +264,9 @@ class ChainOps:
         qkv_a_ll: bool = False,
         qkv_a_bf16: bool = False,
         index_q_mxfp8_in: bool = False,
+        q_norm_gemm: bool = False,
+        index_q_first: bool = False,
+        index_weights_bf16: bool = False,
     ):
         self.rope_in_attention = rope_in_attention
         self.wq_b_ll = wq_b_ll_applies(attn)
@@ -271,6 +281,15 @@ class ChainOps:
         self.index_q_mxfp8_in = (
             index_q_mxfp8_in and self.wq_b_ll and index_q_mxfp8_applies(attn)
         )
+        # slot attn_q_norm_gemm: at 1-8 rows the norm + quant run inside wq_b's GEMM in
+        # layers without an indexer, where the prepare path defers them (bitwise)
+        self.q_norm_gemm = q_norm_gemm and self.wq_b_ll
+        # slot attn_index_q_first: with the plugin indexer, the index query's wq_b runs on
+        # the main stream with its RoPE + pack, wq_b on the second stream (bitwise)
+        self.index_q_first = index_q_first and self.wq_b_ll
+        # slot attn_index_weights_bf16: with the plugin indexer, the BF16 head weights
+        # the scorers read come beside the head weights, not as a cast before them
+        self.index_weights_bf16 = index_weights_bf16
         self.kv_to_cache = ops.kv_to_cache
 
     def index_q_input(self, attn, q_lora, q_for_wqb):
@@ -326,7 +345,16 @@ class ChainOps:
             codes, scales.reshape(-1), w.weight, w.weight_scale_inv_swizzled
         )
 
-    def normalize_q_lora(self, attn, q):
+    def defers_norm(self, attn, rows: int) -> bool:
+        """Whether slot attn_q_norm_gemm takes this step's norm into wq_b's GEMM."""
+        return self.q_norm_gemm and not q_norm_gemm.reason(
+            attn.wq_b.weight, rows, wq_b_consumer(attn)
+        )
+
+    def normalize_q_lora(self, attn, q, defer: bool = False):
+        """``defer`` (from ``defers_norm``): no launch; the first query GEMM norms."""
+        if defer:
+            return None, DeferredNorm(q)
         if not self.wq_b_ll:
             return ops.normalize_q_lora(attn, q)
         y, quant, scale = rmsnorm_mxfp8(
@@ -338,14 +366,28 @@ class ChainOps:
         )
         return y, Mxfp8Rows(quant, scale)
 
-    def compute_q_a(self, attn, x, qkv_a):
+    def compute_q_a(self, attn, x, qkv_a, defer: bool = False):
         q = qkv_a[..., : attn.q_lora_rank] if qkv_a is not None else attn.wq_a(x)[0]
-        return self.normalize_q_lora(attn, q)
+        return self.normalize_q_lora(attn, q, defer)
+
+    def index_q_b(self, attn, q, weight, weight_scale):
+        """The index query's wq_b on the chain's q_lora quant (slot
+        attn_index_q_first): its output, and the quant for wq_b."""
+        return mxfp8_ll.linear(q.quant, q.scale, weight, weight_scale), q
 
     def compute_q_b(self, attn, q, positions, q_out):
         from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope
 
-        if self.wq_b_ll:
+        if isinstance(q, DeferredNorm):
+            out = q_norm_gemm.q_norm_linear(
+                q.q_lora,
+                attn.q_norm.weight,
+                attn.q_norm.variance_epsilon,
+                attn.wq_b.weight,
+                attn.wq_b.weight_scale_inv_swizzled,
+                consumer=wq_b_consumer(attn),
+            )
+        elif self.wq_b_ll:
             out = mxfp8_ll.linear(
                 q.quant,
                 q.scale,
@@ -501,7 +543,12 @@ def wo_a(attn, o, positions, fb, row_tiles: bool = False, *, fused=None):
 
 
 def precompile(
-    attn, widths, *, qkv_a_ll: bool = False, wo_a_one_group: bool = False
+    attn,
+    widths,
+    *,
+    qkv_a_ll: bool = False,
+    wo_a_one_group: bool = False,
+    q_norm_gemm_on: bool = False,
 ) -> None:
     """Compile the chain's kernels that do not depend on the KV pool, for these widths:
     the low-latency wq_b GEMM, the fused wo_a, and the norm + quant (its row count and
@@ -538,6 +585,11 @@ def precompile(
                 attn.q_norm.variance_epsilon,
                 pdl=True,
                 row_tiles=r > mxfp8_ll.MAX_ROWS,
+            )
+        if q_norm_gemm_on:
+            eps = attn.q_norm.variance_epsilon
+            q_norm_gemm.precompile(
+                attn.wq_b.weight, rows, eps, consumer=wq_b_consumer(attn)
             )
     if fused_wo_a_applies(attn, wo_a_one_group):
         groups = attn.n_local_groups

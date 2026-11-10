@@ -81,6 +81,9 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
             index_after_wait="attn_index_after_wait" in SLOTS,
             swapab_h8="swapab_h8" in SLOTS,
             wo_a_g1="wo_a_g1" in SLOTS,
+            q_norm_gemm="attn_q_norm_gemm" in SLOTS,
+            index_q_first="attn_index_q_first" in SLOTS,
+            index_weights_bf16="attn_index_weights_bf16" in SLOTS,
         )
         if chain_on:
             ops0 = step_.chain[0]
@@ -93,7 +96,11 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
                 if narrow_indexer:
                     step_.chain[1].indexer = step_indexer
             chain.precompile(
-                attn, ctx.widths, qkv_a_ll=qkv_a_ll, wo_a_one_group="wo_a_g1" in SLOTS
+                attn,
+                ctx.widths,
+                qkv_a_ll=qkv_a_ll,
+                wo_a_one_group="wo_a_g1" in SLOTS,
+                q_norm_gemm_on=ops0.q_norm_gemm and attn.indexer is None,
             )
             kinds[_chain_kind(attn, step_)] += 1
     logger.info(
@@ -121,6 +128,12 @@ def _chain_kind(attn, step_: AttentionStep) -> str:
             + (", swap-AB widths too" if step_.chain[1].indexer is not None else "")
             + (", fused consumers 1-8" if step_.chain[0].indexer.fused else "")
         )
+    if step_.chain[0].indexer is not None and step_.chain[0].index_q_first:
+        parts.append("index query first on the main stream")
+    if step_.chain[0].indexer is not None and step_.chain[0].index_weights_bf16:
+        parts.append("BF16 index head weights beside the head weights")
+    if step_.chain[0].q_norm_gemm and attn.indexer is None:
+        parts.append("q_norm + quant inside wq_b's GEMM 1-8")
     parts.append("wq_b low-latency 1-48" if step_.chain[0].wq_b_ll else "wq_b SGLang's")
     swapab = (
         f"swap-AB 1-24 ({attn.n_local_heads} heads)" if step_.swapab else "no swap-AB"

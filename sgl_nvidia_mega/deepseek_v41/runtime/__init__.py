@@ -104,7 +104,14 @@ DRAFT_SLOTS = frozenset(
 # TP8 runs (each bitwise to its TP4 kernel on the same heads / group, not to SGLang's
 # TP8 arm); no effect at TP4); attn_index_after_wait: on the indexer layers, swap-AB
 # reads a stock top-k's selection only after its PDL wait (a captured stream join is a
-# programmatic edge and the stock top-k triggers before it writes; bitwise)
+# programmatic edge and the stock top-k triggers before it writes; bitwise);
+# attn_q_norm_gemm: at 1-8 rows the q_lora norm + MXFP8 quant inside wq_b's GEMM in
+# the layers without an indexer, target and draft (sm103/attention/q_norm_gemm.py;
+# bitwise; 0-0.5 us a layer); attn_index_q_first: the plugin indexer's index query
+# (wq_b, RoPE + pack) on the main stream and wq_b on the second, so the index chain does
+# not wait for the SMs wq_b and the attention hold (bitwise); attn_index_weights_bf16:
+# the index head weights the BF16 scorers read made beside the head weights, not cast
+# before the logits (bitwise)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -116,6 +123,9 @@ OPT_IN_SLOTS = (
     "swapab_h8",
     "wo_a_g1",
     "attn_index_after_wait",
+    "attn_q_norm_gemm",
+    "attn_index_q_first",
+    "attn_index_weights_bf16",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -192,6 +202,9 @@ def slot_reasons() -> list[str]:
         ("swapab_h8", "attn"),
         ("wo_a_g1", "attn"),
         ("attn_index_after_wait", "kv_before_wait"),
+        ("attn_q_norm_gemm", "attn"),
+        ("attn_index_q_first", "attn_indexer"),
+        ("attn_index_weights_bf16", "attn_indexer"),
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
@@ -394,6 +407,24 @@ def build(model, ctx):
         "attn_index_after_wait": any(
             a.index_after_wait and a.swapab for a in bound["attention"].values()
         ),
+        # the norm inside wq_b's GEMM: a chain with the low-latency wq_b, 1-8 rows
+        "attn_q_norm_gemm": any(w <= 8 for w in pctx.widths)
+        and any(
+            a.chain is not None and a.chain[1].q_norm_gemm
+            for a in bound["attention"].values()
+        ),
+        "attn_index_q_first": any(
+            a.chain is not None
+            and a.chain[0].indexer is not None
+            and a.chain[0].index_q_first
+            for a in bound["attention"].values()
+        ),
+        "attn_index_weights_bf16": any(
+            a.chain is not None
+            and a.chain[0].indexer is not None
+            and a.chain[0].index_weights_bf16
+            for a in bound["attention"].values()
+        ),
         # the indexer wq_b on the chain's q_lora quant: indexer layers, 1-8 rows
         "index_q_mxfp8_in": any(w <= 8 for w in pctx.widths)
         and any(
@@ -410,9 +441,7 @@ def build(model, ctx):
         else {"kv_before_wait"}
     )
     # every package's build agrees across ranks, so this raises on every rank alike
-    missing = sorted(
-        name for name in (SLOTS & built.keys()) - moot if not built[name]
-    )
+    missing = sorted(name for name in (SLOTS & built.keys()) - moot if not built[name])
     if missing:
         raise RuntimeError(
             f"NVIDIA megakernel: requested slots {missing} built at no width "

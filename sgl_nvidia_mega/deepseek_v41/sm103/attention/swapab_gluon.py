@@ -67,6 +67,150 @@ def _load_v4(
     return gl.where(d[None, :] < 448, fp8 * scale, rope.to(gl.float32)).to(gl.bfloat16)
 
 
+# Fused combine (FUSED): the row's tile CTAs meet at a per-row counter. Each thread
+# fences its partial stores, thread 0 arrives (release), every thread polls (acquire)
+# until all NT tiles arrived, or traps past the deadline (ns). Thread 0 then arrives a
+# second time; the row's last second arrival resets the counter for the next launch.
+_ARRIVE_WAIT: gl.constexpr = gl.constexpr(
+    "{\n"
+    ".reg .pred p;\n"
+    ".reg .u32 tid;\n"
+    ".reg .u64 t0, t1;\n"
+    "mov.u32 tid, %tid.x;\n"
+    "setp.eq.u32 p, tid, 0;\n"
+    "@p red.release.gpu.global.add.u32 [$1], 1;\n"
+    "mov.u64 t0, %globaltimer;\n"
+    "POLL:\n"
+    "ld.acquire.gpu.global.u32 $0, [$1];\n"
+    "setp.ge.u32 p, $0, $2;\n"
+    "@p bra DONE;\n"
+    "mov.u64 t1, %globaltimer;\n"
+    "sub.u64 t1, t1, t0;\n"
+    "setp.gt.u64 p, t1, $3;\n"
+    "@p trap;\n"
+    "bra POLL;\n"
+    "DONE:\n"
+    "}"
+)
+_DEPART: gl.constexpr = gl.constexpr(
+    "{\n"
+    ".reg .pred p;\n"
+    ".reg .u32 tid, v;\n"
+    "mov.u32 $0, 0;\n"
+    "mov.u32 tid, %tid.x;\n"
+    "setp.eq.u32 p, tid, 0;\n"
+    "@p atom.relaxed.gpu.global.add.u32 v, [$1], 1;\n"
+    "@p setp.eq.u32 p, v, $2;\n"
+    "@p st.relaxed.gpu.global.u32 [$1], 0;\n"
+    "}"
+)
+
+
+@gluon.jit
+def _globaltimer():
+    return gl.inline_asm_elementwise(
+        "mov.u64 $0, %globaltimer;", "=l", [], dtype=gl.int64, is_pure=False, pack=1
+    )
+
+
+@gluon.jit
+def _stamp(STAMP, base, k: gl.constexpr):
+    gl.store(STAMP + base + k, _globaltimer())
+
+
+@gluon.jit
+def _row_barrier(CNT, NT: gl.constexpr, DEADLINE):
+    gl.inline_asm_elementwise(
+        "fence.acq_rel.gpu; // $0", "=r", [], dtype=gl.int32, is_pure=False, pack=1
+    )
+    gl.barrier()
+    address = CNT.to(gl.int64)
+    gl.inline_asm_elementwise(
+        _ARRIVE_WAIT,
+        "=r,l,r,l",
+        [address, gl.to_tensor(NT), DEADLINE.to(gl.int64)],
+        dtype=gl.int32,
+        is_pure=False,
+        pack=1,
+    )
+    gl.barrier()
+    gl.inline_asm_elementwise(
+        _DEPART,
+        "=r,l,r",
+        [address, gl.to_tensor(2 * NT - 1)],
+        dtype=gl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@gluon.jit
+def _combine_units(
+    PART,
+    MAX,
+    SUM,
+    SINK,
+    OUT,
+    b,
+    t,
+    NT: gl.constexpr,
+    ST: gl.constexpr,
+    HQ: gl.constexpr,
+    ROUNDS: gl.constexpr,
+):
+    # swapab._combine's narrow program (one warp per head and 128 columns, the same
+    # layouts along the tiles), the row's HQ * 4 programs spread over its tile CTAs
+    units: gl.constexpr = HQ * 4
+    stat: gl.constexpr = gl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0])
+    vals_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 4], [1, 1, 32], [4, 1, 1], [2, 1, 0]
+    )
+    wide: gl.constexpr = gl.SliceLayout(2, vals_layout)
+    out_layout: gl.constexpr = gl.SliceLayout(1, vals_layout)
+    wv = gl.arange(0, 4, gl.SliceLayout(1, stat))
+    tv = gl.arange(0, ST, gl.SliceLayout(0, stat))
+    w3 = gl.arange(0, 4, gl.SliceLayout(1, wide))
+    t3 = gl.arange(0, ST, gl.SliceLayout(0, wide))
+    d3 = gl.arange(0, 128, gl.SliceLayout(0, out_layout))
+    wo = gl.arange(0, 4, gl.SliceLayout(1, out_layout))
+    for r in gl.static_range(ROUNDS):
+        u = (r * 4 + wv) * NT + t
+        ok = u < units
+        h = u // 4
+        soff = (b * NT + tv[None, :]) * HQ + h[:, None]
+        smask = (tv[None, :] < NT) & ok[:, None]
+        den = gl.load(SUM + soff, smask, 0.0)
+        mx = gl.load(MAX + soff, smask, 0.0)
+        mx = gl.where(den > 0, mx, -float("inf"))
+        sink = gl.load(SINK + h, ok, 0.0)
+        m = gl.maximum(gl.max(mx, 1), sink)
+        m = gl.where(gl.abs(m) == float("inf"), 0.0, m)
+        factor = gl.exp(mx - m[:, None])
+        denominator = gl.sum(den * factor, 1) + gl.exp(sink - m)
+        keep = (denominator > 0) & (sink != float("inf"))
+        u3 = (r * 4 + w3) * NT + t
+        ok3 = u3 < units
+        row = (b * NT + t3[None, :]) * HQ + (u3 // 4)[:, None]
+        off = (
+            row[:, :, None] * 512 + ((u3 % 4) * 128)[:, None, None] + d3[None, None, :]
+        )
+        vmask = ((t3[None, :] < NT) & ok3[:, None])[:, :, None]
+        vals = gl.load(PART + off, vmask, 0.0)
+        f3 = gl.convert_layout(factor, wide)
+        acc = gl.sum(vals * f3[:, :, None], 1)
+        dn = gl.convert_layout(denominator, gl.SliceLayout(1, out_layout))
+        kp = gl.convert_layout(keep, gl.SliceLayout(1, out_layout))
+        o = acc / dn[:, None]
+        o = gl.where(kp[:, None], o, 0.0)
+        uo = (r * 4 + wo) * NT + t
+        ooff = (b * HQ + uo // 4) * 512 + (uo % 4) * 128
+        gl.store(
+            OUT + ooff[:, None] + d3[None, :],
+            o.to(gl.bfloat16),
+            (uo < units)[:, None],
+        )
+
+
 @gluon.jit
 def partial_gluon(
     Q,
@@ -107,9 +251,32 @@ def partial_gluon(
     ROPE_Q: gl.constexpr = False,
     KV_BEFORE_WAIT: gl.constexpr = False,
     HQ: gl.constexpr = 16,
+    FUSED: gl.constexpr = False,
+    CNT=None,
+    SINK=None,
+    OUT=None,
+    DEADLINE=None,
+    ST: gl.constexpr = 16,
+    ROUNDS: gl.constexpr = 1,
+    STAMPS: gl.constexpr = False,
+    STAMP=None,
+    STAGE_BEFORE_WAIT: gl.constexpr = 0,
 ):
     gl.static_assert(SWAP_AB and H == 16 and (BT == 64 or BT == 128))
     gl.static_assert(HQ == H or HQ == 8)
+    gl.static_assert(not STAGE_BEFORE_WAIT or (KV_BEFORE_WAIT and USE_GDC))
+    if FUSED:
+        # the row's tiles are adjacent in launch order
+        t, b = gl.program_id(0), gl.program_id(1)
+    else:
+        b, t = gl.program_id(0), gl.program_id(1)
+    if STAMPS:
+        sbase = (b * NT + t) * 16
+        _stamp(STAMP, sbase, 0)
+        smid = gl.inline_asm_elementwise(
+            "mov.u32 $0, %smid;", "=r", [], dtype=gl.int32, is_pure=True, pack=1
+        )
+        gl.store(STAMP + sbase + 15, smid.to(gl.int64))
     if USE_GDC:
         if not KV_BEFORE_WAIT:
             # tl.extra.cuda.gdc_wait + gdc_launch_dependents; every input is read after the wait.
@@ -129,7 +296,8 @@ def partial_gluon(
             is_pure=False,
             pack=1,
         )
-    b, t = gl.program_id(0), gl.program_id(1)
+    if STAMPS:
+        _stamp(STAMP, sbase, 1)
     kv_layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [4, 1], [1, 0])
     n = gl.arange(0, BT, gl.SliceLayout(1, kv_layout))
     if t < KT:
@@ -166,6 +334,22 @@ def partial_gluon(
         )
     qh = gl.arange(0, H, gl.SliceLayout(1, kv_layout))
     qd = gl.arange(0, 512, gl.SliceLayout(0, kv_layout))
+    if STAGE_BEFORE_WAIT:
+        # The query's RoPE row loaded (the positions are step inputs, the table a
+        # constant) and, at 2, the KV tile staged in shared memory, while Q is in flight
+        if STAGE_BEFORE_WAIT == 2:
+            kv_smem = gl.allocate_shared_memory(
+                gl.bfloat16,
+                [BT, 512],
+                gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16),
+                value=kv,
+            )
+        if ROPE_Q:
+            is_rope = qd >= 448
+            pos = gl.load(POS + b)
+            f_idx = pos * 64 + ((qd - 448) // 2) * 2
+            cos = gl.load(FREQS + f_idx, is_rope, 0.0)[None, :]
+            sin = gl.load(FREQS + f_idx + 1, is_rope, 0.0)[None, :]
     if USE_GDC and KV_BEFORE_WAIT:
         # Only Q comes from the PDL predecessor; the KV rows and indices were ordered
         # before this launch by the caller's stream joins.
@@ -177,6 +361,8 @@ def partial_gluon(
             is_pure=False,
             pack=1,
         )
+        if STAMPS:
+            _stamp(STAMP, sbase, 2)
     q_ptr = Q + b * QS + qh[:, None] * QH + qd[None, :]
     if HQ < H:
         q = gl.load(q_ptr, (qh < HQ)[:, None], 0.0)
@@ -193,10 +379,11 @@ def partial_gluon(
         else:
             pair = gl.load(pair_ptr).to(gl.float32)
         x = q.to(gl.float32)
-        pos = gl.load(POS + b)
-        f_idx = pos * 64 + ((qd - 448) // 2) * 2
-        cos = gl.load(FREQS + f_idx, is_rope, 0.0)[None, :]
-        sin = gl.load(FREQS + f_idx + 1, is_rope, 0.0)[None, :]
+        if not STAGE_BEFORE_WAIT:
+            pos = gl.load(POS + b)
+            f_idx = pos * 64 + ((qd - 448) // 2) * 2
+            cos = gl.load(FREQS + f_idx, is_rope, 0.0)[None, :]
+            sin = gl.load(FREQS + f_idx + 1, is_rope, 0.0)[None, :]
         even = (qd % 2 == 0)[None, :]
         rotated = gl.where(
             even, gl.fma(x, cos, -(pair * sin)), gl.fma(pair, sin, x * cos)
@@ -208,12 +395,15 @@ def partial_gluon(
         gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16),
         value=q,
     )
-    kv_smem = gl.allocate_shared_memory(
-        gl.bfloat16,
-        [BT, 512],
-        gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16),
-        value=kv,
-    )
+    if STAGE_BEFORE_WAIT != 2:
+        kv_smem = gl.allocate_shared_memory(
+            gl.bfloat16,
+            [BT, 512],
+            gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=16),
+            value=kv,
+        )
+    if STAMPS:
+        _stamp(STAMP, sbase, 3)
     score_tmem = allocate_tensor_memory(
         gl.float32, [BT, H], TensorMemoryLayout(block=(BT, H), col_stride=1)
     )
@@ -226,6 +416,8 @@ def partial_gluon(
     score_layout: gl.constexpr = get_tmem_reg_layout(
         gl.float32, (BT, H), TensorMemoryLayout(block=(BT, H), col_stride=1), 4
     )
+    if STAMPS:
+        _stamp(STAMP, sbase, 4)
     scores = score_tmem.load(score_layout) * SCALE
     valid = gl.convert_layout(valid, gl.SliceLayout(1, score_layout))
     scores = gl.where(valid[:, None], scores, -float("inf"))
@@ -255,6 +447,8 @@ def partial_gluon(
         tcgen05_commit(bar)
         mbarrier.wait(bar, phase=0)
     mbarrier.invalidate(bar)
+    if STAMPS:
+        _stamp(STAMP, sbase, 5)
     out_layout: gl.constexpr = get_tmem_reg_layout(
         gl.float32, (512, H), TensorMemoryLayout(block=(128, H), col_stride=1), 4
     )
@@ -278,3 +472,12 @@ def partial_gluon(
         gl.store(part_ptr, value_hd)
         gl.store(MAX + (b * NT + t) * H + hs, gl.convert_layout(mx, stat_layout))
         gl.store(SUM + (b * NT + t) * H + hs, gl.convert_layout(denom, stat_layout))
+    if STAMPS:
+        _stamp(STAMP, sbase, 6)
+    if FUSED:
+        _row_barrier(CNT + b, NT, DEADLINE)
+        if STAMPS:
+            _stamp(STAMP, sbase, 7)
+        _combine_units(PART, MAX, SUM, SINK, OUT, b, t, NT, ST, HQ, ROUNDS)
+        if STAMPS:
+            _stamp(STAMP, sbase, 8)

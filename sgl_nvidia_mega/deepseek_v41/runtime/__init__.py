@@ -112,7 +112,11 @@ DRAFT_SLOTS = frozenset(
 # plan.MEASUREMENT_ONLY_SLOTS;
 # attn_indexer_narrow: slot attn_indexer at the swap-AB widths too (1-24 rows);
 # attn_indexer_fused: that, and the candidate consumers' logits + top-k at 1-8 rows in
-# one cluster launch, sm103/attention/reindex_select.py)
+# one cluster launch, sm103/attention/reindex_select.py;
+# prologue_fork: the Engram hashes forked at the step start and the embedding written
+# into the streams, bitwise; engram_side_ar: the Engram prefetch's two all-reduces on
+# its own stream, joined at the first Engram gate, bitwise; hc_coeff_fused: the
+# prenorm's mHC coefficients in one launch, bitwise with hc_prenorm's two)
 OPT_IN_SLOTS = (
     "draft_embed",
     "hop_b_cap16",
@@ -130,6 +134,9 @@ OPT_IN_SLOTS = (
     "draft_lm_head_mxfp8",
     "attn_indexer_narrow",
     "attn_indexer_fused",
+    "prologue_fork",
+    "engram_side_ar",
+    "hc_coeff_fused",
 )
 # Hardware covered only when listed in the same variable (sm148: the 148 SMs of a B300,
 # the target spec's resident blocks)
@@ -212,6 +219,9 @@ def slot_reasons() -> list[str]:
         ("draft_wo_b_ll", "draft_wo_a"),
         ("swapab_h8", "attn"),
         ("wo_a_g1", "attn"),
+        ("engram_side_ar", "engram"),
+        ("engram_side_ar", "prologue_fork"),
+        ("hc_coeff_fused", "hc_prenorm"),
     ):
         if slot in SLOTS and needs not in SLOTS:
             reasons.append(f"{SLOTS_ENV}: slot {slot!r} needs slot {needs!r}")
@@ -321,6 +331,7 @@ def build(model, ctx):
 
     from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
     from sgl_nvidia_mega.deepseek_v41.attention.chain import SWAPAB_MAX_ROWS
+    from sgl_nvidia_mega.deepseek_v41.boundary import prenorm
     from sgl_nvidia_mega.deepseek_v41.runtime import embedding
     from sgl_nvidia_mega.deepseek_v41.runtime.executor import (
         PACKAGES,
@@ -359,6 +370,8 @@ def build(model, ctx):
         engram_prefetch=engram.prefetch is not None,
         two_shot=getattr(bound["boundary"], "two_shot", None) is not None,
         fast_gate_wide="gate_wide" in SLOTS,
+        prologue_fork="prologue_fork" in SLOTS,
+        engram_side_ar="engram_side_ar" in SLOTS,
     )
     slots = {
         w: msgspec.structs.replace(s, hop_a=s.hop_a and w in hop.rows)
@@ -375,6 +388,7 @@ def build(model, ctx):
             for step in bound["attention"].values()
         ),
         "hc_prenorm": bound["boundary"].prenorm,
+        "hc_coeff_fused": bound["boundary"].prenorm and bool(prenorm.fused()),
         "early_trigger": "early_trigger" in SLOTS and facts.hop_a,
         "hop_a_batch2": any(
             s.hop_a and w > slot_plan.HOP_A_BATCH1_ROWS for w, s in slots.items()
@@ -403,6 +417,8 @@ def build(model, ctx):
             s.fast_gate and w not in slot_plan.FAST_GATE_ROWS for w, s in slots.items()
         ),
         "req_pos_once": "req_pos_once" in SLOTS,
+        "prologue_fork": "prologue_fork" in SLOTS,
+        "engram_side_ar": any(s.engram_side_ar for s in slots.values()),
         "attn_indexer": any(
             a.chain is not None and a.chain[0].indexer is not None
             for a in bound["attention"].values()

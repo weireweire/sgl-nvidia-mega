@@ -18,6 +18,11 @@ verify kernel, which SGLang ported from the vLLM ReplaySSM reference implementat
 (Apache License 2.0, Copyright contributors to the vLLM project). Each adapted file
 names its origin in its header.
 
+Portions are adapted from DeepGEMM (https://github.com/deepseek-ai/DeepGEMM): the
+K-split body of sgl_nvidia_mega/deepseek_v41/sm103/src/hc_coeff.cu follows its
+sm100_tf32_hc_prenorm_gemm kernel (MIT License, Copyright (c) 2025 DeepSeek; the full
+notice is kept in that file).
+
 Portions are adapted from FlashInfer (https://github.com/flashinfer-ai/flashinfer):
 the Lamport all-reduce primitives and the low-latency all-reduce (Apache License
 2.0, Copyright (c) 2026 by FlashInfer team), and the epilogue of the wo_b GEMM

@@ -17,7 +17,13 @@ most ``MAX_ROWS`` rows:
   quarters in one all-reduce on SGLang's TP group.
 
 Every cross-GPU wait is on the main stream, in the same order on every rank, as in
-SGLang's inline path. Both all-reduces sum one owner's value with zeros and the WKV
+SGLang's inline path. With slot ``engram_side_ar`` (``run_side`` / ``join``) both
+all-reduces run on the side stream instead, right behind the lookups and the WKV
+quarters, still in the same order on every rank; the main stream only waits for the
+gathered rows at ``gather_at``. Both spin beside the main stream's Lamport hops:
+SGLang's one-shot push kernel (152 CTAs of 128 threads, no shared memory at 6 rows)
+and the hops' few CTAs fit on an SM beside any resident kernel, so neither waits for
+the other to leave one. Both all-reduces sum one owner's value with zeros and the WKV
 runs the same CuTe DSL GEMM, so the rows equal SGLang's inline ones bit for bit;
 build checks that at every width it serves, with the new buffers poisoned first.
 """
@@ -192,6 +198,7 @@ class EngramPrefetch:
         self.looked_up = torch.cuda.Event()
         self.reduced = torch.cuda.Event()
         self.wkv_done = torch.cuda.Event()
+        self.kv_ready = torch.cuda.Event()
         self.rows = 0
         self.kv = None  # this step's rows [layers, rows, n], from ``gather``
         self._emb = None  # ``reduce``'s all-reduced rows, read by the side stream
@@ -247,6 +254,28 @@ class EngramPrefetch:
         torch.cuda.current_stream().wait_event(self.wkv_done)
         self._emb = None  # the side stream's reads of it are now ordered before main
         self.kv = self.group.all_reduce(self._parts(self.rows))
+
+    def run_side(self, hash_ids: torch.Tensor) -> None:
+        """Slot engram_side_ar: ``issue``, ``reduce`` and ``gather`` all on the side
+        stream (called on it, after the hashes); ``join`` hands the rows to main."""
+        self.issue(hash_ids)
+        with torch.cuda.stream(self.stream):
+            first = next(iter(self.layers.values())).engram
+            emb = first.embed._reduce_owned_rows(self._looked(self.rows))
+            self._emb = emb
+            parts = self._parts(self.rows)
+            parts.zero_()
+            for j, layer in enumerate(self.layers.values()):
+                parts[j, :, layer.cols] = layer.quarter(emb[j])
+            self.kv = self.group.all_reduce(parts)
+            self.kv_ready.record(self.stream)
+
+    def join(self) -> None:
+        """Main stream at ``gather_at`` (slot engram_side_ar): wait for the rows."""
+        main = torch.cuda.current_stream()
+        main.wait_event(self.kv_ready)
+        self.kv.record_stream(main)
+        self._emb = None
 
     def gate(self, layer_id: int, x: torch.Tensor) -> torch.Tensor:
         """``Engram.forward(x, ...)`` of layer ``layer_id`` from its gathered rows."""
@@ -337,18 +366,26 @@ def build(model, ctx, group):
         return None, error
     # every collective below runs on the main stream, in the same order on every
     # rank; a mismatch is recorded, not raised, so no rank leaves them early
+    from sgl_nvidia_mega.deepseek_v41 import runtime
+
+    paths = ("main", "side") if "engram_side_ar" in runtime.SLOTS else ("main",)
     mismatch = ""
     for w in widths:
-        prefetch.poison(0xFF)
-        prefetch.issue(ids[w])
-        prefetch.reduce()
-        prefetch.gather()
-        for i, layer in prefetch.layers.items():
-            e = layer.engram
-            want, _ = e.wkv(e.embed(ids[w][:, e.layer_hash_index]).flatten(-2))
-            got = prefetch.kv[prefetch.index[i]]
-            if not mismatch and not torch.equal(got, want):
-                mismatch = f"layer {i} at {w} rows: not SGLang's rows"
+        for path in paths:
+            prefetch.poison(0xFF)
+            if path == "side":
+                prefetch.run_side(ids[w])
+                prefetch.join()
+            else:
+                prefetch.issue(ids[w])
+                prefetch.reduce()
+                prefetch.gather()
+            for i, layer in prefetch.layers.items():
+                e = layer.engram
+                want, _ = e.wkv(e.embed(ids[w][:, e.layer_hash_index]).flatten(-2))
+                got = prefetch.kv[prefetch.index[i]]
+                if not mismatch and not torch.equal(got, want):
+                    mismatch = f"layer {i} at {w} rows ({path}): not SGLang's rows"
     prefetch.kv = None
     error = _any_error(group, mismatch)
     return (None, error) if error else (prefetch, "")
